@@ -1,0 +1,855 @@
+#!/usr/bin/env python
+# coding:utf-8
+
+import os
+import sys
+import re
+import time
+import logging
+
+COMPRESSIONS = ['.gz', '.bz2', '.xz']
+
+config_var_pattern = re.compile(
+    r'set[\t ]+(?P<key>[^\s]+)[\t ]+(?P<value>"[^"]+"|\'[^\']+\'|[^\s]+)')
+config_mirror_pattern = re.compile(r"""
+    ^[\t ]*
+    (?P<type>deb-src|deb)
+    (?:-(?P<arch>[\w\-]+))?
+    [\t ]+
+    (?:\[(?P<options>[^\]]+)\][\t ]+)?
+    (?P<uri>[^\s]+)
+    [\t ]+
+    (?P<components>.+)$
+    """, re.X)
+config_clean_pattern = re.compile(
+    r'(?P<type>clean|skip-clean)[\t ]+(?P<uri>[^\s]+)')
+
+default_arch = os.popen('dpkg --print-architecture').read().strip()
+
+config_variables = {"defaultarch": default_arch or 'i386',
+                    "nthreads": '20',
+                    "base_path": '/var/spool/apt-mirror',
+                    "mirror_path": '$base_path/mirror',
+                    "skel_path": '$base_path/skel',
+                    "var_path": '$base_path/var',
+                    "cleanscript": '$var_path/clean.sh',
+                    "_contents": '1',
+                    "_autoclean": '0',
+                    "_tilde": '0',
+                    "limit_rate": '100m',
+                    "run_postmirror": '1',
+                    "auth_no_challenge": '0',
+                    "no_check_certificate": '0',
+                    "unlink": '0',
+                    "postmirror_script": '$var_path/postmirror.sh',
+                    "use_proxy": 'off',
+                    "http_proxy": '',
+                    "https_proxy": '',
+                    "proxy_user": '',
+                    "proxy_password": ''}
+
+config_binaries = []
+config_sources = []
+index_urls = []
+
+childrens = []
+
+skipclean = {}
+clean_directory = {}
+
+config_file = "/etc/apt/mirror.list"
+
+if len(sys.argv) > 1:
+    config_file = sys.argv[1]
+    if not os.path.exists(config_file):
+        print 'apt-mirror: invalid config file specified'
+        sys.exit(1)
+
+
+def output(string):
+    sys.stdout.write(string)
+    sys.stdout.flush()
+
+
+def round_number(n):
+    return round(n, 1)
+
+
+def format_bytes(bytes):
+    size_name = 'bytes'
+    KiB = 1024
+    MiB = 1024 * 1024
+    GiB = 1024 * 1024 * 1024
+
+    if bytes >= GiB:
+        bytes_out = float(bytes) / GiB
+        size_name = 'GiB'
+    elif bytes >= MiB:
+        bytes_out = float(bytes) / MiB
+        size_name = 'MiB'
+    elif bytes >= KiB:
+        bytes_out = float(bytes) / KiB
+        size_name = 'KiB'
+    else:
+        bytes_out = bytes
+        size_name = 'bytes'
+
+    bytes_out = round_number(bytes_out)
+
+    return str(bytes_out) + ' ' + size_name
+
+
+def get_variable(key):
+    value = config_variables[key]
+    count = 16
+    while 1:
+        refs = re.findall(r'\$(\w+)', value)
+        if refs:
+            for ref in refs:
+                value = value.replace('$' + ref, config_variables[ref])
+            count -= 1
+            if count < 0:
+                raise Exception(
+                    'apt-mirror: too many substitution while evaluating variable')
+        else:
+            break
+
+    if key in ['nthreads', '_contents', '_autoclean', '_tilde',
+               'run_postmirror', 'auth_no_challenge',
+               'no_check_certificate', 'unlink']:
+        try:
+            return int(value)
+        except:
+            pass
+
+    return value
+
+
+def quoted_path(path):
+    path = path.replace("'", "\\'")
+    return "'" + path + "'"
+
+
+LOCK_FILE = None
+
+
+def lock_aptmirror():
+    import fcntl
+    global LOCK_FILE
+    LOCK_FILE = open(os.path.join(get_variable(
+        'var_path'), 'apt-mirror.lock'), 'a')
+    try:
+        fcntl.lockf(LOCK_FILE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except:
+        print "apt-mirror is already running, exiting"
+        sys.exit(1)
+
+
+def unlock_aptmirror():
+    LOCK_FILE.close()
+    os.unlink(os.path.join(get_variable("var_path"), "apt-mirror.lock"))
+
+
+def download_urls(stage, urls):
+    global childrens
+    i = 0
+    nthreads = int(get_variable("nthreads"))
+    args = []
+
+    if len(urls) < nthreads:
+        nthreads = len(urls)
+
+    if get_variable("auth_no_challenge") == 1:
+        args.append("--auth-no-challenge")
+    if get_variable("no_check_certificate") == 1:
+        args.append("--no-check-certificate")
+    if get_variable("unlink") == 1:
+        args.append("--unlink")
+    if get_variable("use_proxy") and (get_variable("use_proxy") == 'yes' or get_variable("use_proxy") == 'on'):
+        if get_variable("http_proxy") or get_variable("https_proxy"):
+            args.append("-e use_proxy=yes")
+        if get_variable("http_proxy"):
+            args.append("-e http_proxy=" + get_variable("http_proxy"))
+        if get_variable("https_proxy"):
+            args.append("-e https_proxy=" + get_variable("https_proxy"))
+        if get_variable("proxy_user"):
+            args.append("-e proxy_user=" + get_variable("proxy_user"))
+        if get_variable("proxy_password"):
+            args.append("-e proxy_password=" + get_variable("proxy_password"))
+    print "Downloading ", len(urls),  stage, "files using", nthreads, "threads..."
+
+    while urls:
+        # splice
+        amount = len(urls) / nthreads
+        part = urls[:amount]
+        urls = urls[amount:]
+        with open(os.path.join(get_variable('var_path'), stage + '-urls.%d' % i), 'w') as URLS:
+            URLS.write('\n'.join(part))
+
+        pid = os.fork()
+        if pid == 0:
+            os.execlp('wget', '--no-cache',
+                      '--limit-rate=' + get_variable("limit_rate"),
+                      '-t', '5', '-r', '-N', '-l', 'inf',
+                      '-o', get_variable("var_path") + "/" +
+                      stage + "-log.%d" % i,
+                      '-i', get_variable("var_path") + "/" + stage + "-urls.%d" % i, *args)
+
+            # shouldn't reach this unless exec fails
+            raise Exception(
+                "\n\nCould not run wget, please make sure its installed and in your path\n\n")
+
+        childrens.append(pid)
+        i += 1
+        nthreads -= 1
+
+    print "Begin time: ", time.strftime('%b %a  %H:%M:%S %Y')
+    output("[" + str(len(childrens)) + "]... ")
+    while(childrens):
+        children, _status = os.wait()
+        childrens = [c for c in childrens if c != children]
+        output("[" + str(len(childrens)) + "]... ")
+    print "\nEnd time: ", time.strftime('%b %a  %H:%M:%S %Y'), "\n"
+
+
+def parse_config_line(line):
+    match = re.match(config_mirror_pattern, line)
+    if match:
+        config = match.groupdict()
+        if config['options'] == None:
+            config['options'] = ''
+        arch_option_match = re.match(
+            r'arch=((?P<arch>[\w\-]+)[,]*)', config['options'])
+        if arch_option_match:
+            config['arch'] = arch_option_match.groupdict()['arch']
+        config['components'] = config['components'].split()
+    else:
+        match = re.match(config_var_pattern, line)
+        if match:
+            config = match.groupdict()
+            config['type'] = 'set'
+            config['value'] = re.sub(r"^'(.*)'", r'\g<1>', config['value'])
+            config['value'] = re.sub(r'^"(.*)"', r'\g<1>', config['value'])
+        else:
+            match = re.match(config_clean_pattern, line)
+            if match:
+                config = match.groupdict()
+
+    return config
+
+
+CONFIG = open(config_file)
+line_number = 0
+for line in CONFIG.readlines():
+    line_number += 1
+    if re.match(r'^\s*#', line):
+        continue
+    if not re.match(r'\S', line):
+        continue
+    config_line = parse_config_line(line)
+
+    if config_line['type'] == "set":
+        config_variables[config_line['key']] = config_line['value']
+        continue
+    elif config_line['type'] == "deb":
+        arch = config_line['arch'] or get_variable("defaultarch")
+        components = config_line['components']
+        config_binaries.append(
+            [arch, config_line['uri'], components[0], components[1:]])
+        continue
+    elif config_line['type'] == "deb-src":
+        components = config_line['components']
+        config_sources.append(
+            [config_line['uri'], components[0], components[1:]])
+        continue
+    elif config_line['type'] in ['skip-clean', 'clean']:
+        link = config_line['uri']
+        link = link.split('://', 1)[1].rstrip('/')
+        if get_variable('_tilde'):
+            link = link.replace('~', '%7E')
+        if config_line['type'] == "skip-clean":
+            skipclean[link] = 1
+        elif config_line['type'] == "clean":
+            clean_directory[link] = 1
+        continue
+
+    raise Exception(
+        "apt-mirror: invalid line in config file (%d: %s ...)" % (line_number, line))
+
+
+if not get_variable('defaultarch'):
+    raise Exception("Please explicitly specify 'defaultarch' in mirror.list")
+
+##########################################################################
+# Create the 3 needed directories if they don't exist yet
+needed_directories = (get_variable("mirror_path"),
+                      get_variable("skel_path"),
+                      get_variable("var_path"))
+for directory in needed_directories:
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+#
+##########################################################################
+
+lock_aptmirror()
+
+##########################################################################
+# Skel download
+
+urls_to_download = {}
+
+
+def remove_double_slashes(string):
+    if get_variable("_tilde"):
+        string = string.replace('~', '%7E')
+    return string
+
+
+def add_url_to_download(url, size=0, compressed=False):
+    download_url = remove_double_slashes(url)
+    if compressed:
+        for ext in COMPRESSIONS:
+            urls_to_download[download_url + ext] = size
+    else:
+        urls_to_download[download_url] = size
+
+
+for uri, distribution, components in config_sources:
+    if components:
+        url = uri + "/dists/" + distribution + "/"
+
+        add_url_to_download(url + "InRelease")
+        add_url_to_download(url + "Release")
+        add_url_to_download(url + "Release.gpg")
+        for component in components:
+            add_url_to_download(url + component + "/source/Release")
+            add_url_to_download(
+                url + component + "/source/Sources", compressed=True)
+    else:
+        add_url_to_download(uri + "/" + distribution + "/Release")
+        add_url_to_download(uri + "/" + distribution + "/Release.gpg")
+        add_url_to_download(uri + "/" + distribution +
+                            "/Sources", compressed=True)
+
+for arch, uri, distribution, components in config_binaries:
+    if components:
+        url = uri + "/dists/" + distribution + "/"
+
+        add_url_to_download(url + "InRelease")
+        add_url_to_download(url + "Release")
+        add_url_to_download(url + "Release.gpg")
+        if get_variable("_contents"):
+            add_url_to_download(url + "Contents-" + arch, compressed=True)
+        for component in components:
+            if get_variable("_contents"):
+                add_url_to_download(
+                    url + component + "/Contents-" + arch, compressed=True)
+            add_url_to_download(
+                url + component + "/binary-" + arch + "/Release")
+            add_url_to_download(
+                url + component + "/binary-" + arch + "/Packages", compressed=True)
+            add_url_to_download(url + component + "/i18n/Index")
+    else:
+        add_url_to_download(uri + "/" + distribution + "/Release")
+        add_url_to_download(uri + "/" + distribution + "/Release.gpg")
+        add_url_to_download(uri + "/" + distribution +
+                            "/Packages", compressed=True)
+
+os.chdir(get_variable("skel_path"))
+index_urls = sorted(urls_to_download.keys())
+download_urls("index", index_urls)
+
+for key in urls_to_download.keys():
+    key = key.split('://')[-1]
+    if get_variable("_tilde"):
+        key = key.replace('~', '%7E')
+    skipclean[url] = 1
+    if url.endswith('.gz') or url.endswith('.bz2'):
+        skipclean[url.rsplit('.', 1)[0]] = 1
+
+##########################################################################
+# Translation index download
+
+urls_to_download = {}
+
+
+def sanitise_uri(uri):
+    uri = uri.split('://')[-1]
+    if uri.find('@') >= 0:
+        uri = uri.split('@')[-1]
+    # and port information
+    uri = uri.replace(':', '_')
+    if get_variable('_tilde'):
+        uri = uri.replace('~', '%7E')
+    return uri
+
+
+def find_translation_files_in_release(dist_uri, component):
+    # Look in the dists/DIST/Release file for the translation files that belong
+    # to the given component.
+    release_uri = dist_uri + "Release"
+    release_path = get_variable("skel_path") + "/" + sanitise_uri(release_uri)
+
+    STREAM = open(release_path)
+
+    checksums = 0
+    for line in STREAM.readlines():
+        line = line.strip()
+        if checksums:
+            if re.match(r'^ +(.*)', line):
+                parts = line.split()
+                if len(parts) == 3:
+                    _sha1, size, filename = parts
+                    if re.match('^' + component + r'/i18n/Translation-[^./]*\.bz2', filename):
+                        add_url_to_download(dist_uri + filename, int(size))
+                else:
+                    logging.warn("Malformed checksum line \"%s\" in %s" %
+                                 (line, release_uri))
+            else:
+                checksums = 0
+        if not checksums:
+            if line == "SHA256:":
+                checksums = 1
+
+
+def process_translation_index(uri, component):
+    # Extract all translation files from the dists/DIST/COMPONENT/i18n/Index
+    # file. Fall back to parsing dists/DIST/Release if i18n/Index is not found.
+
+    dist_uri = remove_double_slashes(uri)
+
+    base_uri = dist_uri + component + "/i18n/"
+    index_uri = base_uri + "Index"
+    index_path = get_variable("skel_path") + "/" + sanitise_uri(index_uri)
+
+    try:
+        STREAM = open(index_path)
+    except:
+        find_translation_files_in_release(dist_uri, component)
+        return
+
+    checksums = 0
+    for line in STREAM.readlines():
+        line = line.strip()
+        if checksums:
+            if re.match(r'^ +(.*)', line):
+                parts = line.split()
+                if len(parts) == 3:
+                    _sha1, size, filename = parts
+                    add_url_to_download(base_uri + filename, int(size))
+                else:
+                    logging.warn("Malformed checksum line \"%s\" in %s" %
+                                 (line, index_uri))
+            else:
+                checksums = 0
+        if not checksums:
+            if line == "SHA256:" or line == "SHA1:" or line == "MD5Sum:":
+                checksums = 1
+
+    STREAM.close()
+
+
+output("Processing translation indexes: [")
+
+for arch, uri, distribution, components in config_binaries:
+    output("T")
+    if components:
+        url = uri + "/dists/" + distribution + "/"
+
+        for component in components:
+            process_translation_index(url, component)
+
+output("]\n\n")
+
+index_urls += sorted(urls_to_download.keys())
+download_urls("translation", sorted(urls_to_download.keys()))
+
+for url in urls_to_download.keys():
+    url = url.split('://')[-1]
+    if get_variable('_tilde'):
+        url = url.replace('~', '%7E')
+    skipclean[url] = 1
+
+##########################################################################
+# DEP-11 index download
+
+urls_to_download = {}
+
+
+def find_dep11_files_in_release(dist_uri, component, arch):
+    # Look in the dists/DIST/Release file for the DEP-11 files that belong
+    # to the given component and architecture.
+    release_uri = dist_uri + "Release"
+    release_path = get_variable("skel_path") + "/" + sanitise_uri(release_uri)
+
+    STREAM = open(release_path)
+
+    checksums = 0
+    for line in STREAM.readlines():
+        line = line.strip()
+        if checksums:
+            if re.match(r'^ +(.*)', line):
+                parts = line.split()
+                if len(parts) == 3:
+                    _sha1, size, filename = parts
+                    if re.match(component + r'/dep11/(Components-{arch}\.yml|icons-[^./]+\.tar)\.(gz|bz2|xz)', filename):
+                        add_url_to_download(dist_uri . filename, int(size))
+                else:
+                    logging.warn("Malformed checksum line \"%s\" in %s" %
+                                 (line, release_uri))
+            else:
+                checksums = 0
+        if not checksums:
+            if line == "SHA256:":
+                checksums = 1
+
+
+output("Processing DEP-11 indexes: [")
+
+for arch, uri, distribution, components in config_binaries:
+    output("D")
+    if components:
+        url = uri + "/dists/" + distribution + "/"
+        for component in components:
+            find_dep11_files_in_release(url, component, arch)
+
+output("]\n\n")
+
+index_urls += sorted(urls_to_download.keys())
+download_urls("dep11", sorted(urls_to_download.keys()))
+
+for url in urls_to_download.keys():
+    url = url.split('://')[-1]
+    if get_variable('_tilde'):
+        url = url.replace('~', '%7E')
+    skipclean[url] = 1
+
+##########################################################################
+# Main download preparations
+
+urls_to_download = {}
+
+FILES_ALL = open(os.path.join(get_variable("var_path"), 'ALL'), 'w')
+FILES_NEW = open(os.path.join(get_variable("var_path"), 'NEW'), 'w')
+FILES_MD5 = open(os.path.join(get_variable("var_path"), 'MD5'), 'w')
+FILES_SHA1 = open(os.path.join(get_variable("var_path"), 'SHA1'), 'w')
+FILES_SHA256 = open(os.path.join(get_variable("var_path"), 'SHA256'), 'w')
+
+
+stat_cache = {}
+
+
+def _stat(filename):
+    global stat_cache
+    if filename in stat_cache:
+        return stat_cache[filename]
+    try:
+        size = os.stat(filename).st_size
+        stat_cache[filename] = size
+    except:
+        size = 0
+    stat_cache[filename] = size
+    return size
+
+
+def clear_stat_cache():
+    global stat_cache
+    stat_cache = {}
+
+
+def need_update(filename, size_on_server):
+    size = _stat(filename)
+    if not size:
+        return 1
+    elif size_on_server == size:
+        return 0
+    else:
+        return 1
+
+
+def remove_spaces(hashref):
+    for key in hashref:
+        hashref[key] = hashref[key].lstrip(' ')
+
+
+def process_index(uri, index):
+    path = sanitise_uri(uri)
+    mirror = get_variable("mirror_path") + "/" + path
+
+    index_file = os.path.join(path, index)
+
+    if os.path.exists(index_file + '.gz'):
+        os.system("gunzip < %s.gz > %s" % (index_file, index_file))
+    elif os.path.exists(index_file + ".xz"):
+        os.system("xz -d < %s.xz > %s" % (index_file, index_file))
+    elif os.path.exists(index_file + ".bz2"):
+        os.system("bzip2 -d < %s.bz2 > %s" % (index_file, index_file))
+
+    try:
+        STREAM = open(index_file)
+    except:
+        logging.warn(
+            "apt-mirror: can't open index %s in process_index" % index_file)
+        return
+
+    pkg_field_pattern = re.compile(r'^([\w\-]+):(.*)')
+
+    for package in STREAM.read().split('\n\n'):
+        package = package.strip()
+        if not package:
+            continue
+        lines = {'': ''}
+
+        key = ''
+        for line in package.split('\n'):
+            match = re.match(pkg_field_pattern, line)
+            if match:
+                key, value = match.groups()
+                lines[key] = value
+            else:
+                lines[key] += '\n' + line
+
+        if 'Directory' not in lines:
+            lines['Directory'] = ''
+
+        remove_spaces(lines)
+
+        if 'Filename' in lines:
+            # Packages index
+            store_path = remove_double_slashes(path + "/" + lines["Filename"])
+            skipclean[store_path] = 1
+            FILES_ALL.write(store_path + '\n')
+            if 'MD5sum' in lines:
+                FILES_MD5.write(
+                    lines["MD5sum"] + "  " + store_path + "\n")
+            if 'SHA1' in lines:
+                FILES_SHA1.write(
+                    lines['SHA1'] + '  ' + store_path + '\n')
+            if 'SHA256' in lines:
+                FILES_SHA256.write(
+                    lines["SHA256"] + "  " + store_path + "\n")
+            if need_update(mirror + "/" + lines["Filename"], int(lines["Size"])):
+                download_uri = uri + "/" + lines["Filename"]
+                FILES_NEW.write(remove_double_slashes(
+                    download_uri) + "\n")
+                add_url_to_download(
+                    download_uri, int(lines["Size"]))
+        else:
+            # Sources index
+            for line in lines['Files'].split('\n'):
+                line = line.strip()
+                if line == '':
+                    continue
+                try:
+                    checksum, size, fn = line.split()
+                except:
+                    raise Exception('apt-mirror: invalid Sources format')
+                skipclean[remove_double_slashes(
+                    path + "/" + lines["Directory"] + "/" + fn)] = 1
+                FILES_ALL.write(remove_double_slashes(
+                    path + "/" + lines["Directory"] + "/" + fn) + "\n")
+                FILES_MD5.write(checksum + "  " + remove_double_slashes(
+                    path + "/" + lines["Directory"] + "/" + fn) + "\n")
+                if need_update(mirror + "/" + lines["Directory"] + "/" + fn, int(size)):
+                    FILES_NEW.write(remove_double_slashes(
+                        uri + "/" + lines["Directory"] + "/" + fn) + "\n")
+                    add_url_to_download(
+                        uri + "/" + lines["Directory"] + "/" + fn, int(size))
+
+    STREAM.close()
+
+
+output("Processing indexes: [")
+
+
+for uri, distribution, components in config_sources:
+    output("S")
+    if components:
+        for component in components:
+            process_index(uri, "dists/%s/%s/source/Sources" %
+                          (distribution, component))
+    else:
+        process_index(uri, "%s/Sources" % distribution)
+
+for arch, uri, distribution, components in config_binaries:
+    output("P")
+    if components:
+        for component in components:
+            process_index(uri, "dists/%s/%s/binary-%s/Packages" %
+                          (distribution, component, arch))
+    else:
+        process_index(uri, "%s/Packages" % distribution)
+
+clear_stat_cache()
+
+output("]\n\n")
+
+FILES_ALL.close()
+FILES_NEW.close()
+FILES_MD5.close()
+FILES_SHA1.close()
+FILES_SHA256.close()
+
+##########################################################################
+# Main download
+os.chdir(get_variable("mirror_path"))
+
+need_bytes = sum(urls_to_download.itervalues())
+
+size_output = format_bytes(need_bytes)
+
+print size_output, " will be downloaded into archive."
+
+download_urls("archive", sorted(urls_to_download.keys()))
+
+##########################################################################
+# Copy skel to main archive
+
+
+def copy_file(source, target):
+    todir = os.path.dirname(target)
+    if not os.path.exists(source):
+        return
+    if not os.path.isdir(todir):
+        os.makedirs(todir)
+    if get_variable("unlink") == 1 and os.path.exists(target):
+        if os.system("diff -q '%s' '%s' > /dev/null" % (source, target)) != 0:
+            os.unlink(target)
+
+    try:
+        os.system('cp "%s" "%s"' % (source, target))
+    except:
+        logging.warn("apt-mirror: can't copy %s to %s" % (source, target))
+        return
+    source_stat = os.stat(source)
+    os.utime(target, (source_stat.st_atime, source_stat.st_mtime))
+
+
+for url in index_urls:
+    if not re.match(r'^(\w+)://', url):
+        raise Exception("apt-mirror: invalid url in index_urls")
+    copy_file(get_variable("skel_path") + "/" + sanitise_uri(url),
+              get_variable("mirror_path") + "/" + sanitise_uri(url))
+    for compress in COMPRESSIONS:
+        if url.endswith(compress):
+            raw_file = url.rsplit('.', 1)[0]
+            copy_file(get_variable("skel_path") + "/" + sanitise_uri(raw_file),
+                      get_variable("mirror_path") + "/" + sanitise_uri(raw_file))
+
+##########################################################################
+# Make cleaning script
+
+rm_dirs = []
+rm_files = []
+unnecessary_bytes = 0
+
+
+def process_symlink(path):
+    return 1    # symlinks are always needed
+
+
+def process_file(path):
+    global unnecessary_bytes
+    if get_variable("_tilde"):
+        path = path.replace('~', '%7E')
+    if skipclean[path]:
+        return 1
+    rm_files.append(sanitise_uri(path))
+
+    block_count, block_size = os.popen(
+        'stat -c "%b,%B" ' + path).read().strip().split(',')
+    unnecessary_bytes += int(block_count) * int(block_size)
+    return 0
+
+
+def process_directory(directory):
+    is_needed = 0
+    if skipclean[directory]:
+        return 1
+    for sub in os.listdir(directory):
+        path = directory + "/" + sub
+        if os.path.isdir(path) and not os.path.islink(path):
+            is_needed |= process_directory(path)
+        if os.path.isfile(path):
+            is_needed |= process_file(path)
+        if os.path.islink(path):
+            is_needed |= process_symlink(path)
+    if not is_needed:
+        rm_dirs.append(directory)
+    return is_needed
+
+
+os.chdir(get_variable('mirror_path'))
+
+for path in clean_directory:
+    if os.path.isdir(path) and not os.path.islink(path):
+        process_directory(path)
+
+CLEAN = open(get_variable("cleanscript"), 'w')
+
+i = 0
+total = len(rm_files)
+
+if get_variable("_autoclean"):
+    size_output = format_bytes(unnecessary_bytes)
+    print size_output, "in", total, "files and", len(rm_dirs), "directories will be freed..."
+
+    os.chdir(get_variable("mirror_path"))
+
+    for path in rm_files:
+        os.unlink(path)
+    for path in rm_dirs:
+        os.rmdir(path)
+else:
+    size_output = format_bytes(unnecessary_bytes)
+    print size_output, "in", total, "files and", len(rm_dirs), " directories can be freed."
+    print "Run ", get_variable("cleanscript"), " for this purpose.\n"
+
+    CLEAN.write("#!/bin/sh\n")
+    CLEAN.write("set -e\n\n")
+    CLEAN.write("cd " + quoted_path(get_variable("mirror_path")) + "\n\n")
+    CLEAN.write("echo 'Removing %d unnecessary files [%s]...'\n" % (
+        total, size_output))
+    for filepath in rm_files:
+        CLEAN.write("rm -f '%s'\n" % filepath)
+        if i % 500 == 0:
+            CLEAN.write("echo -n '[" + str(int(100 * i / total)) + "%]'\n")
+        if i % 10 == 0:
+            CLEAN.write("echo -n .\n")
+        i += 1
+    CLEAN.write("echo 'done.'\n")
+    CLEAN.write("echo\n\n")
+
+    i = 0
+    total = len(rm_dirs)
+    CLEAN.write("echo 'Removing %d unnecessary directories...'\n" % total)
+    for dirpath in rm_dirs:
+        CLEAN.write("if test -d '%s'; then rmdir '%s'; fi\n" %
+                    (dirpath, dirpath))
+        if i % 50 == 0:
+            CLEAN.write("echo -n '[" + str(int(100 * i / total)) + "%]'\n")
+        CLEAN.write("echo -n .\n")
+        i += 1
+    CLEAN.write("echo 'done.'\n")
+    CLEAN.write("echo\n")
+
+    CLEAN.close()
+
+# Make clean script executable
+os.system('chmod a+x ' + get_variable('cleanscript'))
+
+if get_variable("run_postmirror"):
+    post_script = get_variable('postmirror_script')
+    print "Running the Post Mirror script ..."
+    print "(" + post_script + ")\n"
+
+    if os.path.isfile(post_script):
+        if os.access(post_script, os.X_OK):
+            os.system(post_script)
+        else:
+            os.system('/bin/sh ' + get_variable("postmirror_script"))
+    else:
+        logging.warn('Postmirror script not found')
+    print "\nPost Mirror script has completed. See above output for any possible errors.\n"
+
+unlock_aptmirror()
