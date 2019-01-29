@@ -203,13 +203,13 @@ def download_urls(stage, urls):
         i += 1
         nthreads -= 1
 
-    print "Begin time: ", time.strftime('%b %a  %H:%M:%S %Y')
+    print "Begin time: ", time.strftime('%c')
     output("[" + str(len(childrens)) + "]... ")
     while(childrens):
         children, _status = os.wait()
         childrens = [c for c in childrens if c != children]
         output("[" + str(len(childrens)) + "]... ")
-    print "\nEnd time: ", time.strftime('%b %a  %H:%M:%S %Y'), "\n"
+    print "\nEnd time: ", time.strftime('%c'), "\n"
 
 
 def parse_config_line(line):
@@ -493,7 +493,7 @@ def find_dep11_files_in_release(dist_uri, component, arch):
                 if len(parts) == 3:
                     _sha1, size, filename = parts
                     if re.match(component + r'/dep11/(Components-{arch}\.yml|icons-[^./]+\.tar)\.(gz|bz2|xz)', filename):
-                        add_url_to_download(dist_uri . filename, int(size))
+                        add_url_to_download(dist_uri + filename, int(size))
                 else:
                     logging.warn("Malformed checksum line \"%s\" in %s" %
                                  (line, release_uri))
