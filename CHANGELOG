@@ -1,3 +1,5 @@
+* 0.2 (2019-01-30)
+ - An object-oriented version.
 * 0.1 (2019-01-29)
  - Basically a line-by-line translation of the apt-mirror 0.5.4.
  - No manual, but the perl apt-mirror manual is OK.
