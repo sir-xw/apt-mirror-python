@@ -6,47 +6,9 @@ import sys
 import re
 import time
 import logging
+from config import MirrorConfig
 
 COMPRESSIONS = ['.gz', '.bz2', '.xz']
-
-CONFIG_VAR_PATTERN = re.compile(
-    r'set[\t ]+(?P<key>[^\s]+)[\t ]+(?P<value>"[^"]+"|\'[^\']+\'|[^\s]+)')
-CONFIG_MIRROR_PATTERN = re.compile(r"""
-    ^[\t ]*
-    (?P<type>deb-src|deb)
-    (?:-(?P<arch>[\w\-]+))?
-    [\t ]+
-    (?:\[(?P<options>[^\]]+)\][\t ]+)?
-    (?P<uri>[^\s]+)
-    [\t ]+
-    (?P<components>.+)$
-    """, re.X)
-CONFIG_CLEAN_PATTERN = re.compile(
-    r'(?P<type>clean|skip-clean)[\t ]+(?P<uri>[^\s]+)')
-
-default_arch = os.popen('dpkg --print-architecture').read().strip()
-
-config_variables = {"defaultarch": default_arch or 'i386',
-                    "nthreads": '20',
-                    "base_path": '/var/spool/apt-mirror',
-                    "mirror_path": '$base_path/mirror',
-                    "skel_path": '$base_path/skel',
-                    "var_path": '$base_path/var',
-                    "cleanscript": '$var_path/clean.sh',
-                    "_contents": '1',
-                    "_autoclean": '0',
-                    "_tilde": '0',
-                    "limit_rate": '100m',
-                    "run_postmirror": '1',
-                    "auth_no_challenge": '0',
-                    "no_check_certificate": '0',
-                    "unlink": '0',
-                    "postmirror_script": '$var_path/postmirror.sh',
-                    "use_proxy": 'off',
-                    "http_proxy": '',
-                    "https_proxy": '',
-                    "proxy_user": '',
-                    "proxy_password": ''}
 
 config_file = "/etc/apt/mirror.list"
 
@@ -151,32 +113,6 @@ def download_urls(stage, urls, context):
         childrens = [c for c in childrens if c != children]
         output("[" + str(len(childrens)) + "]... ")
     print "\nEnd time: ", time.strftime('%c'), "\n"
-
-
-def parse_config_line(line):
-    match = CONFIG_MIRROR_PATTERN.match(line)
-    if match:
-        config = match.groupdict()
-        if config['options'] == None:
-            config['options'] = ''
-        arch_option_match = re.match(
-            r'arch=((?P<arch>[\w\-]+)[,]*)', config['options'])
-        if arch_option_match:
-            config['arch'] = arch_option_match.groupdict()['arch']
-        config['components'] = config['components'].split()
-    else:
-        match = CONFIG_VAR_PATTERN.match(line)
-        if match:
-            config = match.groupdict()
-            config['type'] = 'set'
-            config['value'] = re.sub(r"^'(.*)'", r'\g<1>', config['value'])
-            config['value'] = re.sub(r'^"(.*)"', r'\g<1>', config['value'])
-        else:
-            match = CONFIG_CLEAN_PATTERN.match(line)
-            if match:
-                config = match.groupdict()
-
-    return config
 
 
 def remove_double_slashes(string, context):
@@ -343,12 +279,7 @@ class AptMirror(object):
         self.rm_files = []
         self.unnecessary_bytes = 0
         # config
-        self.variables = dict(config_variables)
-        self.binaries = []
-        self.sources = []
-        self.skipclean = {}
-        self.clean_directory = {}
-        self.parse_config(config_file)
+        self.config = MirrorConfig(config_file)
         return
 
     def run(self):
@@ -369,92 +300,19 @@ class AptMirror(object):
 
         self.unlock_aptmirror()
 
-    def get_variable(self, key):
-        value = self.variables[key]
-        count = 16
-        while 1:
-            refs = re.findall(r'\$(\w+)', value)
-            if refs:
-                for ref in refs:
-                    value = value.replace('$' + ref, self.variables[ref])
-                count -= 1
-                if count < 0:
-                    raise Exception(
-                        'apt-mirror: too many substitution while evaluating variable')
-            else:
-                break
-        # int variables
-        if key in ['nthreads', '_contents', '_autoclean', '_tilde',
-                   'run_postmirror', 'auth_no_challenge',
-                   'no_check_certificate', 'unlink']:
-            try:
-                return int(value)
-            except:
-                pass
-
-        return value
-    
-    def __getattribute__(self, attr):
-        try:
-            return object.__getattribute__(self, attr)
-        except:
-            return self.get_variable(attr)
-
-    def parse_config(self, config_file):
-        cf = open(config_file)
-        line_number = 0
-        for line in cf.readlines():
-            line_number += 1
-            if re.match(r'^\s*#', line):
-                continue
-            if not re.match(r'\S', line):
-                continue
-            config_line = parse_config_line(line)
-
-            if config_line['type'] == "set":
-                self.variables[config_line['key']] = config_line['value']
-                continue
-            elif config_line['type'] == "deb":
-                arch = config_line['arch'] or self.defaultarch
-                components = config_line['components']
-                self.binaries.append(
-                    [arch, config_line['uri'], components[0], components[1:]])
-                continue
-            elif config_line['type'] == "deb-src":
-                components = config_line['components']
-                self.sources.append(
-                    [config_line['uri'], components[0], components[1:]])
-                continue
-            elif config_line['type'] in ['skip-clean', 'clean']:
-                link = config_line['uri']
-                link = link.split('://', 1)[1].rstrip('/')
-                if self._tilde:
-                    link = link.replace('~', '%7E')
-                if config_line['type'] == "skip-clean":
-                    self.skipclean[link] = 1
-                elif config_line['type'] == "clean":
-                    self.clean_directory[link] = 1
-                continue
-
-            raise Exception(
-                "apt-mirror: invalid line in config file (%d: %s ...)" % (line_number, line))
-
-        if not self.defaultarch:
-            raise Exception(
-                "Please explicitly specify 'defaultarch' in mirror.list")
-
     def init(self):
         # Create the 3 needed directories if they don't exist yet
-        needed_directories = (self.mirror_path,
-                              self.skel_path,
-                              self.var_path)
+        needed_directories = (self.config.mirror_path,
+                              self.config.skel_path,
+                              self.config.var_path)
         for directory in needed_directories:
             if not os.path.isdir(directory):
                 os.makedirs(directory)
 
     def lock_aptmirror(self):
         import fcntl
-        self.lock_file = open(os.path.join(self.var_path, 'apt-mirror.lock'), 'a')
+        self.lock_file = open(os.path.join(
+            self.config.var_path, 'apt-mirror.lock'), 'a')
         try:
             fcntl.lockf(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except:
@@ -463,7 +321,7 @@ class AptMirror(object):
 
     def unlock_aptmirror(self):
         self.lock_file.close()
-        os.unlink(os.path.join(self.var_path, "apt-mirror.lock"))
+        os.unlink(os.path.join(self.config.var_path, "apt-mirror.lock"))
 
     def _stat(self, filename):
         if filename in self.stat_cache:
@@ -489,7 +347,7 @@ class AptMirror(object):
             return 1
 
     def add_url_to_download(self, url, size=0, compressed=False):
-        download_url = remove_double_slashes(url, self)
+        download_url = remove_double_slashes(url, self.config)
         if compressed:
             for ext in COMPRESSIONS:
                 self.urls_to_download[download_url + ext] = size
@@ -497,8 +355,8 @@ class AptMirror(object):
             self.urls_to_download[download_url] = size
 
     def process_index(self, uri, index):
-        path = sanitise_uri(uri, self)
-        mirror = self.mirror_path + "/" + path
+        path = sanitise_uri(uri, self.config)
+        mirror = self.config.mirror_path + "/" + path
 
         index_path = os.path.join(path, index)
 
@@ -541,8 +399,8 @@ class AptMirror(object):
             if 'Filename' in lines:
                 # Packages index
                 store_path = remove_double_slashes(path + "/" + lines["Filename"],
-                                                   self)
-                self.skipclean[store_path] = 1
+                                                   self.config)
+                self.config.skipclean[store_path] = 1
                 self.file_all.write(store_path + '\n')
                 if 'MD5sum' in lines:
                     self.file_md5.write(
@@ -556,7 +414,7 @@ class AptMirror(object):
                 if self.need_update(mirror + "/" + lines["Filename"], int(lines["Size"])):
                     download_uri = uri + "/" + lines["Filename"]
                     self.file_new.write(remove_double_slashes(
-                        download_uri, self) + "\n")
+                        download_uri, self.config) + "\n")
                     self.add_url_to_download(
                         download_uri, int(lines["Size"]))
             else:
@@ -570,8 +428,8 @@ class AptMirror(object):
                     except:
                         raise Exception('apt-mirror: invalid Sources format')
                     store_path = remove_double_slashes(path + "/" + lines["Directory"] + "/" + fn,
-                                                       self)
-                    self.skipclean[store_path] = 1
+                                                       self.config)
+                    self.config.skipclean[store_path] = 1
                     self.file_all.write(store_path + "\n")
                     self.file_md5.write(checksum + "  " + store_path + "\n")
                     if self.need_update(mirror + "/" + lines["Directory"] + "/" + fn, int(size)):
@@ -579,7 +437,7 @@ class AptMirror(object):
                             lines["Directory"] + "/" + fn
                         self.file_new.write(remove_double_slashes(
                             download_uri,
-                            self
+                            self.config
                         ) + "\n")
                         self.add_url_to_download(
                             download_uri, int(size))
@@ -588,7 +446,7 @@ class AptMirror(object):
 
     def download_skel(self):
         self.urls_to_download = {}
-        for uri, distribution, components in self.sources:
+        for uri, distribution, components in self.config.sources:
             if components:
                 url = uri + "/dists/" + distribution + "/"
 
@@ -607,18 +465,18 @@ class AptMirror(object):
                 self.add_url_to_download(uri + "/" + distribution +
                                          "/Sources", compressed=True)
 
-        for arch, uri, distribution, components in self.binaries:
+        for arch, uri, distribution, components in self.config.binaries:
             if components:
                 url = uri + "/dists/" + distribution + "/"
 
                 self.add_url_to_download(url + "InRelease")
                 self.add_url_to_download(url + "Release")
                 self.add_url_to_download(url + "Release.gpg")
-                if self._contents:
+                if self.config._contents:
                     self.add_url_to_download(
                         url + "Contents-" + arch, compressed=True)
                 for component in components:
-                    if self._contents:
+                    if self.config._contents:
                         self.add_url_to_download(
                             url + component + "/Contents-" + arch, compressed=True)
                     self.add_url_to_download(
@@ -633,82 +491,83 @@ class AptMirror(object):
                 self.add_url_to_download(uri + "/" + distribution +
                                          "/Packages", compressed=True)
 
-        os.chdir(self.skel_path)
+        os.chdir(self.config.skel_path)
         self.index_urls = sorted(self.urls_to_download.keys())
-        download_urls("index", self.index_urls, self)
+        download_urls("index", self.index_urls, self.config)
 
         for key in self.urls_to_download.keys():
-            key = key.split('://')[-1]
-            if self._tilde:
-                key = key.replace('~', '%7E')
-            self.skipclean[url] = 1
-            if url.endswith('.gz') or url.endswith('.bz2'):
-                self.skipclean[url.rsplit('.', 1)[0]] = 1
+            path = key.split('://')[-1]
+            if self.config._tilde:
+                path = path.replace('~', '%7E')
+            self.config.skipclean[path] = 1
+            if path.endswith('.gz') or path.endswith('.bz2'):
+                self.config.skipclean[path.rsplit('.', 1)[0]] = 1
 
     def download_translation(self):
         # Translation index download
         self.urls_to_download = {}
         output("Processing translation indexes: [")
-        for _arch, uri, distribution, components in self.binaries:
+        for _arch, uri, distribution, components in self.config.binaries:
             output("T")
             if components:
                 url = uri + "/dists/" + distribution + "/"
 
                 for component in components:
-                    for url, size in find_translation_files_in_index(url, component, self).iteritems():
+                    for url, size in find_translation_files_in_index(url, component, self.config).iteritems():
                         self.add_url_to_download(url, size)
 
         output("]\n\n")
 
         self.index_urls.extend(sorted(self.urls_to_download.keys()))
         download_urls("translation", sorted(
-            self.urls_to_download.keys()), self)
+            self.urls_to_download.keys()), self.config)
 
         for url in self.urls_to_download.keys():
             url = url.split('://')[-1]
-            if self._tilde:
+            if self.config._tilde:
                 url = url.replace('~', '%7E')
-            self.skipclean[url] = 1
+            self.config.skipclean[url] = 1
 
     def download_dep11(self):
         # DEP-11 index download
         self.urls_to_download = {}
         output("Processing DEP-11 indexes: [")
-        for arch, uri, distribution, components in self.binaries:
+        for arch, uri, distribution, components in self.config.binaries:
             output("D")
             if components:
                 url = uri + "/dists/" + distribution + "/"
                 for component in components:
-                    for url, size in find_dep11_files_in_release(url, component, arch, self).iteritems():
+                    for url, size in find_dep11_files_in_release(url, component, arch, self.config).iteritems():
                         self.add_url_to_download(url, size)
 
         output("]\n\n")
 
         self.index_urls.extend(sorted(self.urls_to_download.keys()))
-        download_urls("dep11", sorted(self.urls_to_download.keys()), self)
+        download_urls("dep11", sorted(
+            self.urls_to_download.keys()), self.config)
 
         for url in self.urls_to_download.keys():
             url = url.split('://')[-1]
-            if self._tilde:
+            if self.config._tilde:
                 url = url.replace('~', '%7E')
-            self.skipclean[url] = 1
+            self.config.skipclean[url] = 1
 
     def download_archive(self):
         self.urls_to_download = {}
 
         self.file_all = open(os.path.join(
-            self.var_path, 'ALL'), 'w')
+            self.config.var_path, 'ALL'), 'w')
         self.file_new = open(os.path.join(
-            self.var_path, 'NEW'), 'w')
+            self.config.var_path, 'NEW'), 'w')
         self.file_md5 = open(os.path.join(
-            self.var_path, 'MD5'), 'w')
+            self.config.var_path, 'MD5'), 'w')
         self.file_sha1 = open(os.path.join(
-            self.var_path, 'SHA1'), 'w')
+            self.config.var_path, 'SHA1'), 'w')
         self.file_sha256 = open(os.path.join(
-            self.var_path, 'SHA256'), 'w')
+            self.config.var_path, 'SHA256'), 'w')
 
         output("Processing indexes: [")
-        for uri, distribution, components in self.sources:
+        for uri, distribution, components in self.config.sources:
             output("S")
             if components:
                 for component in components:
@@ -717,7 +576,7 @@ class AptMirror(object):
             else:
                 self.process_index(uri, "%s/Sources" % distribution)
 
-        for arch, uri, distribution, components in self.binaries:
+        for arch, uri, distribution, components in self.config.binaries:
             output("P")
             if components:
                 for component in components:
@@ -735,7 +594,7 @@ class AptMirror(object):
         self.file_md5.close()
         self.file_sha1.close()
         self.file_sha256.close()
-        os.chdir(self.mirror_path)
+        os.chdir(self.config.mirror_path)
 
         need_bytes = sum(self.urls_to_download.itervalues())
 
@@ -743,30 +602,32 @@ class AptMirror(object):
 
         print size_output, " will be downloaded into archive."
 
-        download_urls("archive", sorted(self.urls_to_download.keys()), self)
+        download_urls("archive", sorted(
+            self.urls_to_download.keys()), self.config)
 
     def copy_skel(self):
         # Copy skel to main archive
         for url in self.index_urls:
             if not re.match(r'^(\w+)://', url):
                 raise Exception("apt-mirror: invalid url in index_urls")
-            rel_url = sanitise_uri(url, self)
-            copy_file(self.skel_path + "/" + rel_url,
-                      self.mirror_path + "/" + rel_url)
+            rel_url = sanitise_uri(url, self.config)
+            copy_file(self.config.skel_path + "/" + rel_url,
+                      self.config.mirror_path + "/" + rel_url,
+                      unlink=self.config.unlink)
             for ext in COMPRESSIONS:
                 if url.endswith(ext):
                     raw_file = url.rsplit('.', 1)[0]
-                    rel_url = sanitise_uri(raw_file, self)
-                    copy_file(self.skel_path + "/" + rel_url,
-                              self.mirror_path + "/" + rel_url,
-                              unlink=self.unlink)
+                    rel_url = sanitise_uri(raw_file, self.config)
+                    copy_file(self.config.skel_path + "/" + rel_url,
+                              self.config.mirror_path + "/" + rel_url,
+                              unlink=self.config.unlink)
 
     def process_file(self, path):
-        if self._tilde:
+        if self.config._tilde:
             path = path.replace('~', '%7E')
-        if self.skipclean.get(path):
+        if self.config.skipclean.get(path):
             return 1
-        self.rm_files.append(sanitise_uri(path, self))
+        self.rm_files.append(sanitise_uri(path, self.config))
 
         block_count, block_size = os.popen(
             'stat -c "%b,%B" ' + path).read().strip().split(',')
@@ -775,7 +636,7 @@ class AptMirror(object):
 
     def process_directory(self, directory):
         is_needed = 0
-        if self.skipclean.get(directory):
+        if self.config.skipclean.get(directory):
             return 1
         for sub in os.listdir(directory):
             path = directory + "/" + sub
@@ -792,22 +653,22 @@ class AptMirror(object):
         return is_needed
 
     def clean(self):
-        os.chdir(self.mirror_path)
+        os.chdir(self.config.mirror_path)
 
-        for path in self.clean_directory:
+        for path in self.config.clean_directory:
             if os.path.isdir(path) and not os.path.islink(path):
                 self.process_directory(path)
 
-        script = open(self.cleanscript, 'w')
+        script = open(self.config.cleanscript, 'w')
 
         i = 0
         total = len(self.rm_files)
         size_output = format_bytes(self.unnecessary_bytes)
 
-        if self._autoclean:
+        if self.config._autoclean:
             print size_output, "in", total, "files and", len(self.rm_dirs), "directories will be freed..."
 
-            os.chdir(self.mirror_path)
+            os.chdir(self.config.mirror_path)
 
             for path in self.rm_files:
                 os.unlink(path)
@@ -815,12 +676,12 @@ class AptMirror(object):
                 os.rmdir(path)
         else:
             print size_output, "in", total, "files and", len(self.rm_dirs), " directories can be freed."
-            print "Run ", self.cleanscript, " for this purpose.\n"
+            print "Run ", self.config.cleanscript, " for this purpose.\n"
 
             script.write("#!/bin/sh\n")
             script.write("set -e\n\n")
             script.write(
-                "cd " + quoted_path(self.mirror_path) + "\n\n")
+                "cd " + quoted_path(self.config.mirror_path) + "\n\n")
             script.write("echo 'Removing %d unnecessary files [%s]...'\n" % (
                 total, size_output))
             for filepath in self.rm_files:
@@ -840,7 +701,7 @@ class AptMirror(object):
                 "echo 'Removing %d unnecessary directories...'\n" % total)
             for dirpath in self.rm_dirs:
                 script.write("if test -d '%s'; then rmdir '%s'; fi\n" %
-                            (dirpath, dirpath))
+                             (dirpath, dirpath))
                 if i % 50 == 0:
                     script.write(
                         "echo -n '[" + str(int(100 * i / total)) + "%]'\n")
@@ -852,13 +713,13 @@ class AptMirror(object):
             script.close()
 
         # Make clean script executable
-        os.system('chmod a+x ' + self.cleanscript)
+        os.system('chmod a+x ' + self.config.cleanscript)
 
     def post(self):
-        if not self.run_postmirror:
+        if not self.config.run_postmirror:
             return
 
-        post_script = self.postmirror_script
+        post_script = self.config.postmirror_script
         print "Running the Post Mirror script ..."
         print "(" + post_script + ")\n"
 
@@ -866,7 +727,7 @@ class AptMirror(object):
             if os.access(post_script, os.X_OK):
                 os.system(post_script)
             else:
-                os.system('/bin/sh ' + self.postmirror_script)
+                os.system('/bin/sh ' + post_script)
         else:
             logging.warn('Postmirror script not found')
         print "\nPost Mirror script has completed. See above output for any possible errors.\n"
