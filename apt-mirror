@@ -300,6 +300,19 @@ urls_to_download = {}
 
 
 def remove_double_slashes(string):
+    while 1:
+        string, match = re.subn(r'/\./', '/', string)
+        if not match:
+            break
+    while 1:
+        string, match = re.subn(r'(?<!:)//', '/', string)
+        if not match:
+            break
+    while 1:
+        string, match = re.subn(r'(?<!:/)/[^/]+/\.\./', '/', string)
+        if not match:
+            break
+
     if get_variable("_tilde"):
         string = string.replace('~', '%7E')
     return string
