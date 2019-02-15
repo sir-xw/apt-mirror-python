@@ -7,7 +7,7 @@ with open('VERSION', 'r') as fh:
     version = fh.read().strip()
 
 setuptools.setup(
-    name='apt-mirror-xiewei',
+    name='apt-mirror-python',
     version=version,
     author='Xie Wei',
     author_email='xw.master@live.cn',
