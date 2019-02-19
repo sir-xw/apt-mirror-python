@@ -14,7 +14,7 @@ except ImportError:
     import Queue as queue
 from .config import MirrorConfig
 from .utils import remove_double_slashes, remove_spaces, sanitise_uri, format_bytes, quoted_path, copy_file
-from .apt_index import AptIndex
+from .apt_index import MirrorSkel
 
 COMPRESSIONS = ['.gz', '.bz2', '.xz']
 
@@ -110,6 +110,12 @@ class AptMirror(object):
         self.unnecessary_bytes = 0
         # config
         self.config = MirrorConfig(config_file)
+        self.mirrors = []
+        for base_url in self.config.mirrors:
+            skel_path = os.path.join(
+                self.config.skel_path, sanitise_uri(base_url, self.config))
+            self.mirrors.append(MirrorSkel(
+                base_url, skel_path, self.config.mirrors[base_url]))
         return
 
     def run(self):
@@ -184,11 +190,9 @@ class AptMirror(object):
         else:
             self.urls_to_download[download_url] = size
 
-    def process_index(self, uri, index):
-        path = sanitise_uri(uri, self.config)
-        mirror = self.config.mirror_path + "/" + path
-
-        index_path = os.path.join(path, index)
+    def process_index(self, uri, index_path):
+        base_path = sanitise_uri(uri, self.config)
+        mirror = self.config.mirror_path + "/" + base_path
 
         if os.path.exists(index_path + '.gz'):
             os.system("gunzip < %s.gz > %s" % (index_path, index_path))
@@ -230,14 +234,15 @@ class AptMirror(object):
 
             if 'Filename' in data:
                 # Packages index
-                store_path = remove_double_slashes(path + "/" + data["Filename"],
+                store_path = remove_double_slashes(base_path + "/" + data["Filename"],
                                                    self.config)
                 self.config.skipclean[store_path] = 1
                 self.list_files['all'].write(store_path + '\n')
-                
-                for key in ['MD5sum','SHA1','SHA256']:
+
+                for key in ['MD5sum', 'SHA1', 'SHA256']:
                     if key in data:
-                        self.list_files[key].write(data[key]+ '  ' + store_path + '\n')
+                        self.list_files[key].write(
+                            data[key] + '  ' + store_path + '\n')
                 if self.need_update(os.path.join(mirror, data["Filename"]), int(data["Size"])):
                     download_uri = uri + "/" + data["Filename"]
                     self.list_files['new'].write(remove_double_slashes(
@@ -254,11 +259,12 @@ class AptMirror(object):
                         md5sum, size, fn = line.split()
                     except:
                         raise Exception('apt-mirror: invalid Sources format')
-                    store_path = remove_double_slashes(path + "/" + data["Directory"] + "/" + fn,
+                    store_path = remove_double_slashes(base_path + "/" + data["Directory"] + "/" + fn,
                                                        self.config)
                     self.config.skipclean[store_path] = 1
                     self.list_files['all'].write(store_path + "\n")
-                    self.list_files['MD5sum'].write(md5sum + "  " + store_path + "\n")
+                    self.list_files['MD5sum'].write(
+                        md5sum + "  " + store_path + "\n")
                     if self.need_update(mirror + "/" + data["Directory"] + "/" + fn, int(size)):
                         download_uri = uri + "/" + \
                             data["Directory"] + "/" + fn
@@ -273,50 +279,10 @@ class AptMirror(object):
 
     def download_skel(self):
         self.urls_to_download = {}
-        for uri, distribution, components in self.config.sources:
-            if components:
-                url = uri + "/dists/" + distribution + "/"
 
-                self.add_url_to_download(url + "InRelease")
-                self.add_url_to_download(url + "Release")
-                self.add_url_to_download(url + "Release.gpg")
-                for component in components:
-                    self.add_url_to_download(
-                        url + component + "/source/Release")
-                    self.add_url_to_download(
-                        url + component + "/source/Sources", compressed=True)
-            else:
-                self.add_url_to_download(uri + "/" + distribution + "/Release")
-                self.add_url_to_download(
-                    uri + "/" + distribution + "/Release.gpg")
-                self.add_url_to_download(uri + "/" + distribution +
-                                         "/Sources", compressed=True)
-
-        for arch, uri, distribution, components in self.config.binaries:
-            if components:
-                url = uri + "/dists/" + distribution + "/"
-
-                self.add_url_to_download(url + "InRelease")
-                self.add_url_to_download(url + "Release")
-                self.add_url_to_download(url + "Release.gpg")
-                if self.config._contents:
-                    self.add_url_to_download(
-                        url + "Contents-" + arch, compressed=True)
-                for component in components:
-                    if self.config._contents:
-                        self.add_url_to_download(
-                            url + component + "/Contents-" + arch, compressed=True)
-                    self.add_url_to_download(
-                        url + component + "/binary-" + arch + "/Release")
-                    self.add_url_to_download(
-                        url + component + "/binary-" + arch + "/Packages", compressed=True)
-                    self.add_url_to_download(url + component + "/i18n/Index")
-            else:
-                self.add_url_to_download(uri + "/" + distribution + "/Release")
-                self.add_url_to_download(
-                    uri + "/" + distribution + "/Release.gpg")
-                self.add_url_to_download(uri + "/" + distribution +
-                                         "/Packages", compressed=True)
+        for mirror in self.mirrors:
+            for url in mirror.get_index_urls(contents=self.config._contents):
+                self.add_url_to_download(url)
 
         os.chdir(self.config.skel_path)
         self.index_urls = sorted(self.urls_to_download.keys())
@@ -334,14 +300,11 @@ class AptMirror(object):
         # Translation index download
         self.urls_to_download = {}
         output("Processing translation indexes: [")
-        for _arch, uri, distribution, components in self.config.binaries:
-            output("T")
-            if components:
-                index_uri = os.path.join(uri, 'dists', distribution)
-                apt_index = AptIndex(index_uri, self.config)
-                for component in components:
-                    for url, size in apt_index.find_translation_files_in_index(component).iteritems():
-                        self.add_url_to_download(url, size)
+        for mirror in self.mirrors:
+            for suite in mirror.suites:
+                output('T')
+                for url, size in suite.find_translation_files_in_index().items():
+                    self.add_url_to_download(url, size)
 
         output("]\n\n")
 
@@ -359,14 +322,11 @@ class AptMirror(object):
         # DEP-11 index download
         self.urls_to_download = {}
         output("Processing DEP-11 indexes: [")
-        for arch, uri, distribution, components in self.config.binaries:
-            output("D")
-            if components:
-                index_uri = os.path.join(uri, 'dists', distribution)
-                apt_index = AptIndex(index_uri, self.config)
-                for component in components:
-                    for url, size in apt_index.find_dep11_files_in_release(component, arch).iteritems():
-                        self.add_url_to_download(url, size)
+        for mirror in self.mirrors:
+            for suite in mirror.suites:
+                output('D')
+                for url,size in suite.find_dep11_files_in_release().items():
+                    self.add_url_to_download(url,size)
 
         output("]\n\n")
 
@@ -384,39 +344,30 @@ class AptMirror(object):
         self.urls_to_download = {}
 
         self.list_files = {}
-        for key,fn in [('all','ALL'),
-                       ('new','NEW'),
-                       ('MD5sum','MD5'),
-                       ('SHA1','SHA1'),
-                       ('SHA256','SHA256')]:
+        for key, fn in [('all', 'ALL'),
+                        ('new', 'NEW'),
+                        ('MD5sum', 'MD5'),
+                        ('SHA1', 'SHA1'),
+                        ('SHA256', 'SHA256')]:
             self.list_files[key] = open(
-                os.path.join(self.config.var_path,fn),
+                os.path.join(self.config.var_path, fn),
                 'wb'
             )
 
         output("Processing indexes: [")
-        for uri, distribution, components in self.config.sources:
-            output("S")
-            if components:
-                for component in components:
-                    self.process_index(uri, "dists/%s/%s/source/Sources" %
-                                       (distribution, component))
-            else:
-                self.process_index(uri, "%s/Sources" % distribution)
-
-        for arch, uri, distribution, components in self.config.binaries:
-            output("P")
-            if components:
-                for component in components:
-                    self.process_index(uri, "dists/%s/%s/binary-%s/Packages" %
-                                       (distribution, component, arch))
-            else:
-                self.process_index(uri, "%s/Packages" % distribution)
+        for mirror in self.mirrors:
+            for suite in mirror.suites:
+                for source_index in suite.sources:
+                    output('S')
+                    self.process_index(mirror.url, source_index)
+                for package_index in suite.packages:
+                    output('P')
+                    self.process_index(mirror.url, package_index)
 
         self.clear_stat_cache()
 
         output("]\n\n")
-        
+
         for fp in self.list_files.values():
             fp.close()
         os.chdir(self.config.mirror_path)
@@ -434,7 +385,8 @@ class AptMirror(object):
         # Copy skel to main archive
         for url in self.index_urls:
             if not re.match(r'^(\w+)://', url):
-                raise Exception("apt-mirror: invalid url in index_urls")
+                raise Exception(
+                    'apt-mirror: invalid url "%s" in index_urls' % url)
             rel_url = sanitise_uri(url, self.config)
             copy_file(self.config.skel_path + "/" + rel_url,
                       self.config.mirror_path + "/" + rel_url,

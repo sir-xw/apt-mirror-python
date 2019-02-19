@@ -70,8 +70,7 @@ class MirrorConfig(object):
                      "https_proxy": '',
                      "proxy_user": '',
                      "proxy_password": ''}
-        self.binaries = []
-        self.sources = []
+        self.mirrors = {}
         self.skipclean = {}
         self.clean_directory = {}
         if config_file:
@@ -126,13 +125,42 @@ class MirrorConfig(object):
             elif config_line['type'] == "deb":
                 arch = config_line['arch'] or self.defaultarch
                 components = config_line['components']
-                self.binaries.append(
-                    [arch, config_line['uri'], components[0], components[1:]])
+                base_url = config_line['uri']
+                suite = components[0]
+                components = components[1:] or ['']
+                if base_url not in self.mirrors:
+                    self.mirrors[base_url] = {suite:{c:[arch] for c in components}}
+                else:
+                    mirror_data = self.mirrors[base_url]
+                    if suite not in mirror_data:
+                        mirror_data[suite] = {c:set([arch]) for c in components}
+                    else:
+                        suite_data = mirror_data[suite]
+                        for c in components:
+                            if c not in suite_data:
+                                suite_data[c] = [arch]
+                            else:
+                                suite_data[c].add(arch)
                 continue
             elif config_line['type'] == "deb-src":
                 components = config_line['components']
-                self.sources.append(
-                    [config_line['uri'], components[0], components[1:]])
+                arch = 'src'
+                base_url = config_line['uri']
+                suite = components[0]
+                components = components[1:] or ['']
+                if base_url not in self.mirrors:
+                    self.mirrors[base_url] = {suite:{c:[arch] for c in components}}
+                else:
+                    mirror_data = self.mirrors[base_url]
+                    if suite not in mirror_data:
+                        mirror_data[suite] = {c:set([arch]) for c in components}
+                    else:
+                        suite_data = mirror_data[suite]
+                        for c in components:
+                            if c not in suite_data:
+                                suite_data[c] = [arch]
+                            else:
+                                suite_data[c].add(arch)
                 continue
             elif config_line['type'] in ['skip-clean', 'clean']:
                 link = config_line['uri']
