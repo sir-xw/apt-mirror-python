@@ -210,62 +210,59 @@ class AptMirror(object):
             package = package.strip()
             if not package:
                 continue
-            lines = {'': ''}
+            data = {}
 
-            key = ''
+            key = None
             for line in package.split('\n'):
                 match = re.match(pkg_field_pattern, line)
                 if match:
                     key, value = match.groups()
-                    lines[key] = value
+                    data[key] = value
+                elif not key:
+                    continue
                 else:
-                    lines[key] += '\n' + line
+                    data[key] += '\n' + line
 
-            if 'Directory' not in lines:
-                lines['Directory'] = ''
+            if 'Directory' not in data:
+                data['Directory'] = ''
 
-            remove_spaces(lines)
+            remove_spaces(data)
 
-            if 'Filename' in lines:
+            if 'Filename' in data:
                 # Packages index
-                store_path = remove_double_slashes(path + "/" + lines["Filename"],
+                store_path = remove_double_slashes(path + "/" + data["Filename"],
                                                    self.config)
                 self.config.skipclean[store_path] = 1
-                self.file_all.write(store_path + '\n')
-                if 'MD5sum' in lines:
-                    self.file_md5.write(
-                        lines["MD5sum"] + "  " + store_path + "\n")
-                if 'SHA1' in lines:
-                    self.file_sha1.write(
-                        lines['SHA1'] + '  ' + store_path + '\n')
-                if 'SHA256' in lines:
-                    self.file_sha256.write(
-                        lines["SHA256"] + "  " + store_path + "\n")
-                if self.need_update(mirror + "/" + lines["Filename"], int(lines["Size"])):
-                    download_uri = uri + "/" + lines["Filename"]
-                    self.file_new.write(remove_double_slashes(
+                self.list_files['all'].write(store_path + '\n')
+                
+                for key in ['MD5sum','SHA1','SHA256']:
+                    if key in data:
+                        self.list_files[key].write(data[key]+ '  ' + store_path + '\n')
+                if self.need_update(os.path.join(mirror, data["Filename"]), int(data["Size"])):
+                    download_uri = uri + "/" + data["Filename"]
+                    self.list_files['new'].write(remove_double_slashes(
                         download_uri, self.config) + "\n")
                     self.add_url_to_download(
-                        download_uri, int(lines["Size"]))
+                        download_uri, int(data["Size"]))
             else:
                 # Sources index
-                for line in lines['Files'].split('\n'):
+                for line in data['Files'].split('\n'):
                     line = line.strip()
                     if line == '':
                         continue
                     try:
-                        checksum, size, fn = line.split()
+                        md5sum, size, fn = line.split()
                     except:
                         raise Exception('apt-mirror: invalid Sources format')
-                    store_path = remove_double_slashes(path + "/" + lines["Directory"] + "/" + fn,
+                    store_path = remove_double_slashes(path + "/" + data["Directory"] + "/" + fn,
                                                        self.config)
                     self.config.skipclean[store_path] = 1
-                    self.file_all.write(store_path + "\n")
-                    self.file_md5.write(checksum + "  " + store_path + "\n")
-                    if self.need_update(mirror + "/" + lines["Directory"] + "/" + fn, int(size)):
+                    self.list_files['all'].write(store_path + "\n")
+                    self.list_files['MD5sum'].write(md5sum + "  " + store_path + "\n")
+                    if self.need_update(mirror + "/" + data["Directory"] + "/" + fn, int(size)):
                         download_uri = uri + "/" + \
-                            lines["Directory"] + "/" + fn
-                        self.file_new.write(remove_double_slashes(
+                            data["Directory"] + "/" + fn
+                        self.list_files['new'].write(remove_double_slashes(
                             download_uri,
                             self.config
                         ) + "\n")
@@ -386,16 +383,16 @@ class AptMirror(object):
     def download_archive(self):
         self.urls_to_download = {}
 
-        self.file_all = open(os.path.join(
-            self.config.var_path, 'ALL'), 'w')
-        self.file_new = open(os.path.join(
-            self.config.var_path, 'NEW'), 'w')
-        self.file_md5 = open(os.path.join(
-            self.config.var_path, 'MD5'), 'w')
-        self.file_sha1 = open(os.path.join(
-            self.config.var_path, 'SHA1'), 'w')
-        self.file_sha256 = open(os.path.join(
-            self.config.var_path, 'SHA256'), 'w')
+        self.list_files = {}
+        for key,fn in [('all','ALL'),
+                       ('new','NEW'),
+                       ('MD5sum','MD5'),
+                       ('SHA1','SHA1'),
+                       ('SHA256','SHA256')]:
+            self.list_files[key] = open(
+                os.path.join(self.config.var_path,fn),
+                'wb'
+            )
 
         output("Processing indexes: [")
         for uri, distribution, components in self.config.sources:
@@ -419,12 +416,9 @@ class AptMirror(object):
         self.clear_stat_cache()
 
         output("]\n\n")
-
-        self.file_all.close()
-        self.file_new.close()
-        self.file_md5.close()
-        self.file_sha1.close()
-        self.file_sha256.close()
+        
+        for fp in self.list_files.values():
+            fp.close()
         os.chdir(self.config.mirror_path)
 
         need_bytes = sum(self.urls_to_download.itervalues())
