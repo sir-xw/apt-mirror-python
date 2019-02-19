@@ -1,4 +1,3 @@
-#!/usr/bin/env python2
 # coding:utf-8
 
 from __future__ import print_function
@@ -8,6 +7,11 @@ import subprocess
 import re
 import time
 import logging
+import threading
+try:
+    import queue
+except ImportError:
+    import Queue as queue
 from .config import MirrorConfig
 from .utils import remove_double_slashes, remove_spaces, sanitise_uri, format_bytes, quoted_path, copy_file
 from .apt_index import AptIndex
@@ -20,14 +24,40 @@ def output(string):
     sys.stdout.flush()
 
 
-def download_urls(stage, urls, context):
-    childrens = []
-    i = 0
-    nthreads = context.nthreads
-    args = []
+def download(wget_args, logfile, task_queue):
+    while 1:
+        try:
+            url = task_queue.get(block=False)
+            schema, filepath = url.split('://', 1)
+            if schema == 'rsync':
+                subprocess.call(['mkdir', '-p', os.path.dirname(filepath)])
+                subprocess.call(
+                    ['rsync', '-t', '--no-motd', '--log-file', logfile, url, filepath])
+            else:
+                subprocess.call(wget_args + ['-o', logfile, url])
+        except queue.Empty:
+            break
+    output("[" + str(threading.active_count() - 2) + "]... ")
 
+
+def download_urls(stage, urls, context):
+    download_queue = queue.Queue()
+    for url in urls:
+        download_queue.put(url)
+
+    with open(os.path.join(context.var_path,
+                           stage + '-urls'),
+              'wb') as URLS:
+        URLS.write('\n'.join(urls))
+
+    childrens = []
+    nthreads = context.nthreads
     if len(urls) < nthreads:
         nthreads = len(urls)
+
+    args = ['wget', '--no-cache',
+            '--limit-rate=' + context.limit_rate,
+            '-t', '5', '-r', '-N', '-l', 'inf']
 
     if context.auth_no_challenge == 1:
         args.append("--auth-no-challenge")
@@ -49,32 +79,23 @@ def download_urls(stage, urls, context):
     print("Downloading", len(urls),  stage,
           "files using", nthreads, "threads...")
 
-    while urls:
-        # splice
-        amount = len(urls) / nthreads
-        part = urls[:amount]
-        urls = urls[amount:]
-        with open(os.path.join(context.var_path,
-                               stage + '-urls.%d' % i),
-                  'w') as URLS:
-            URLS.write('\n'.join(part))
-
-        child = subprocess.Popen(['wget', '--no-cache',
-                                  '--limit-rate=' + context.limit_rate,
-                                  '-t', '5', '-r', '-N', '-l', 'inf',
-                                  '-o', context.var_path + "/" +
-                                  stage + "-log.%d" % i,
-                                  '-i', context.var_path + "/" + stage + "-urls.%d" % i] + args)
+    for i in range(nthreads):
+        child = threading.Thread(target=download,
+                                 args=(args,
+                                       '%s/%s-log.%d' % (context.var_path,
+                                                         stage, i),
+                                       download_queue))
+        child.start()
         childrens.append(child)
         i += 1
         nthreads -= 1
 
     print("Begin time: ", time.strftime('%c'))
+
     output("[" + str(len(childrens)) + "]... ")
-    while childrens:
-        pid,_retcode = os.wait()
-        childrens = [c for c in childrens if c.pid != pid]
-        output("[" + str(len(childrens)) + "]... ")
+    for child in childrens:
+        child.join()
+
     print("\nEnd time: ", time.strftime('%c'), "\n")
 
 
