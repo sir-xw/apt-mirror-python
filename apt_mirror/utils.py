@@ -5,13 +5,15 @@ import os
 import re
 import logging
 
-def sanitise_uri(uri, context=None):
+TILDE = False
+
+def sanitise_uri(uri):
     uri = uri.split('://')[-1]
     if uri.find('@') >= 0:
         uri = uri.split('@')[-1]
     # and port information
     uri = re.sub(r'\:\d+','',uri)
-    if context and context._tilde:
+    if TILDE:
         uri = uri.replace('~', '%7E')
     return uri
 
@@ -46,7 +48,7 @@ def format_bytes(bytes):
 
     return str(bytes_out) + ' ' + size_name
 
-def remove_double_slashes(string, context):
+def remove_double_slashes(string):
     while 1:
         string, match = re.subn(r'/\./', '/', string)
         if not match:
@@ -60,7 +62,7 @@ def remove_double_slashes(string, context):
         if not match:
             break
 
-    if context._tilde:
+    if TILDE:
         string = string.replace('~', '%7E')
     return string
 

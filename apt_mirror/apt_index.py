@@ -4,7 +4,6 @@
 import os
 import re
 import logging
-from .utils import remove_double_slashes, sanitise_uri
 
 
 class MirrorSkel(object):
@@ -29,11 +28,11 @@ class MirrorSkel(object):
         # TODO:
         return
 
-    def get_index_urls(self, contents=False):
-        index_urls = []
+    def get_indexes(self, contents=False):
+        index_list = []
         for suite in self.suites:
-            index_urls += suite.get_index_urls(contents)
-        return index_urls
+            index_list += suite.get_indexes(contents)
+        return index_list
 
 
 class SuiteSkel(object):
@@ -43,58 +42,58 @@ class SuiteSkel(object):
         self.components = self.mirror.data[suite]
         if len(self.components) == 1 and '' in self.components:
             # simple archive
-            rel_path = suite
+            self.rel_path = suite
             self.simple = True
         else:
-            rel_path = 'dists' + '/' + suite
+            self.rel_path = 'dists' + '/' + suite
             self.simple = False
-        self.url = self.mirror.url + '/' + rel_path
-        self.skel_path = self.mirror.skel_path + '/' + rel_path
+        self.url = self.mirror.url + '/' + self.rel_path
+        self.skel_path = self.mirror.skel_path + '/' + self.rel_path
         self.sources = []
         self.packages = []
         return
 
     def compressed_index(self, rel_path):
         COMPRESSIONS = ['.gz', '.bz2', '.xz']
-        url = self.url + '/' + rel_path
+        path = self.rel_path + '/' + rel_path
         # check index file name
         fn = os.path.basename(rel_path)
         if fn == 'Sources':
             self.sources.append(self.skel_path + '/' + rel_path)
         elif fn == 'Packages':
             self.packages.append(self.skel_path + '/' + rel_path)
-        return [url] + [url + ext for ext in COMPRESSIONS]
+        return [path] + [path + ext for ext in COMPRESSIONS]
 
-    def get_index_urls(self, contents=False):
-        index_urls = [
-            self.url + '/' + fn for fn in ('InRelease', 'Release', 'Release.gpg')]  # Release
+    def get_indexes(self, contents=False):
+        index_list = [os.path.join(self.rel_path, fn) for fn in [
+            'InRelease', 'Release', 'Release.gpg']]  # Release
         # other index
         for component, arch_list in self.components.items():
             for arch in arch_list:
                 if self.simple:
                     if arch == 'src':
-                        index_urls += self.compressed_index('Sources')
+                        index_list += self.compressed_index('Sources')
                     else:
-                        index_urls += self.compressed_index('Packages')
+                        index_list += self.compressed_index('Packages')
                 else:
                     if arch == 'src':
                         rel_dir = component + '/source'
-                        index_urls.append(
-                            self.url + '/' + rel_dir + '/Release')
-                        index_urls += self.compressed_index(
+                        index_list.append(
+                            self.rel_path + '/' + rel_dir + '/Release')
+                        index_list += self.compressed_index(
                             rel_dir + '/Sources')
                     else:
                         rel_dir = component + '/binary-' + arch
-                        index_urls.append(
-                            self.url + '/' + rel_dir + '/Release')
-                        index_urls += self.compressed_index(
+                        index_list.append(
+                            self.rel_path + '/' + rel_dir + '/Release')
+                        index_list += self.compressed_index(
                             rel_dir + '/Packages')
-                        index_urls.append(
-                            self.url + '/' + component + "/i18n/Index")
+                        index_list.append(
+                            self.rel_path + '/' + component + "/i18n/Index")
                         if contents:
-                            index_urls += self.compressed_index(
+                            index_list += self.compressed_index(
                                 component + '/Contents-' + arch)
-        return index_urls
+        return index_list
 
     def find_translation_files_in_release(self):
         """Look in the dists/DIST/Release file for the translation files that belong
@@ -107,7 +106,7 @@ class SuiteSkel(object):
         release_path = self.skel_path + '/Release'
         release_file = open(release_path)
 
-        urls = {}
+        files = {}
         checksums = 0
         for line in release_file.readlines():
             line = line.rstrip()
@@ -117,7 +116,8 @@ class SuiteSkel(object):
                     if len(parts) == 3:
                         _sha1, size, filename = parts
                         if re.match('^(' + '|'.join(self.components) + r')/i18n/Translation-[^./]*\.bz2', filename):
-                            urls[os.path.join(self.url, filename)] = int(size)
+                            files[os.path.join(
+                                self.rel_path, filename)] = int(size)
                     else:
                         logging.warning("Malformed checksum line \"%s\" in %s" %
                                         (line, release_url))
@@ -127,7 +127,7 @@ class SuiteSkel(object):
                 if line == "SHA256:":
                     checksums = 1
         release_file.close()
-        return urls
+        return files
 
     def find_translation_files_in_index(self):
         # Extract all translation files from the dists/DIST/COMPONENT/i18n/Index
@@ -136,9 +136,10 @@ class SuiteSkel(object):
         if self.simple:
             return {}
 
-        urls = {}
+        files = {}
         for component in self.components:
-            base_url = os.path.join(self.url, component, 'i18n')
+            i18n_dir = component + '/i18n'
+            base_url = os.path.join(self.url, i18n_dir)
             index_url = os.path.join(base_url, 'Index')
             index_path = os.path.join(self.skel_path, component, 'i18n/Index')
             try:
@@ -154,7 +155,8 @@ class SuiteSkel(object):
                         parts = line.split()
                         if len(parts) == 3:
                             _checksum, size, filename = parts
-                            urls[os.path.join(base_url, filename)] = int(size)
+                            files[os.path.join(
+                                self.rel_path, i18n_dir, filename)] = int(size)
                         else:
                             logging.warn("Malformed checksum line \"%s\" in %s" %
                                          (line, index_url))
@@ -166,7 +168,7 @@ class SuiteSkel(object):
 
             index_file.close()
 
-        return urls
+        return files
 
     def find_dep11_files_in_release(self):
         # Look in the dists/DIST/Release file for the DEP-11 files
@@ -178,7 +180,7 @@ class SuiteSkel(object):
 
         release_file = open(release_path)
 
-        urls = {}
+        files = {}
         checksums = 0
         for line in release_file.readlines():
             line = line.rstrip()
@@ -191,7 +193,7 @@ class SuiteSkel(object):
                             fn_pattern = r'(Components-(' + '|'.join(arch_list) + \
                                 r')\.yml|icons-[^./]+\.tar)\.(gz|bz2|xz)'
                             if re.match(component + r'/dep11/' + fn_pattern, filename):
-                                urls[os.path.join(self.url, filename)] = int(
+                                files[os.path.join(self.rel_path, filename)] = int(
                                     size)
                                 break
                     else:
@@ -203,4 +205,4 @@ class SuiteSkel(object):
                 if line == "SHA256:":
                     checksums = 1
 
-        return urls
+        return files

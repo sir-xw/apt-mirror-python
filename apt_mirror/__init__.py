@@ -24,7 +24,7 @@ def output(string):
     sys.stdout.flush()
 
 
-def download(wget_args, logfile, task_queue):
+def download_worker(wget_args, rsync_args, logfile, task_queue):
     while 1:
         try:
             url = task_queue.get(block=False)
@@ -32,7 +32,7 @@ def download(wget_args, logfile, task_queue):
             if schema == 'rsync':
                 subprocess.call(['mkdir', '-p', os.path.dirname(filepath)])
                 subprocess.call(
-                    ['rsync', '-t', '--no-motd', '--log-file', logfile, url, filepath])
+                    rsync_args + ['--log-file', logfile, url, filepath])
             else:
                 subprocess.call(wget_args + ['-o', logfile, url])
         except queue.Empty:
@@ -40,63 +40,166 @@ def download(wget_args, logfile, task_queue):
     output("[" + str(threading.active_count() - 2) + "]... ")
 
 
+def wget_batch_downloader(args, listfile, logfile):
+    child = subprocess.Popen(args + ['-o', logfile,
+                                     '-i', listfile,
+                                     ])
+    return child
+
+
+def rsync_batch_downloader(args, listfile, logfile):
+    child = subprocess.Popen(args + ['--log-file', logfile,
+                                     '--files-from', listfile,
+                                     ])
+    return child
+
+
 def download_urls(stage, urls, context):
-    download_queue = queue.Queue()
-    for url in urls:
-        download_queue.put(url)
+    nthreads = min(context.nthreads, len(urls))
 
-    with open(os.path.join(context.var_path,
-                           stage + '-urls'),
-              'wb') as URLS:
-        URLS.write('\n'.join(urls))
-
-    childrens = []
-    nthreads = context.nthreads
-    if len(urls) < nthreads:
-        nthreads = len(urls)
-
-    args = ['wget', '--no-cache',
-            '--limit-rate=' + context.limit_rate,
-            '-t', '5', '-r', '-N', '-l', 'inf']
+    wget_args = ['wget', '--no-cache',
+                 '--limit-rate=' + context.limit_rate,
+                 '-t', '5', '-r', '-N', '-l', 'inf']
+    rsync_args = ['rsync', '-t', '--no-motd',
+                  '--bwlimit', context.limit_rate]
 
     if context.auth_no_challenge == 1:
-        args.append("--auth-no-challenge")
+        wget_args.append("--auth-no-challenge")
     if context.no_check_certificate == 1:
-        args.append("--no-check-certificate")
+        wget_args.append("--no-check-certificate")
     if context.unlink == 1:
-        args.append("--unlink")
+        wget_args.append("--unlink")
+    else:
+        rsync_args.append('--inplace')
     if context.use_proxy and (context.use_proxy == 'yes' or context.use_proxy == 'on'):
         if context.http_proxy or context.https_proxy:
-            args.append("-e use_proxy=yes")
+            wget_args.append("-e use_proxy=yes")
         if context.http_proxy:
-            args.append("-e http_proxy=" + context.http_proxy)
+            wget_args.append("-e http_proxy=" + context.http_proxy)
         if context.https_proxy:
-            args.append("-e https_proxy=" + context.https_proxy)
+            wget_args.append("-e https_proxy=" + context.https_proxy)
         if context.proxy_user:
-            args.append("-e proxy_user=" + context.proxy_user)
+            wget_args.append("-e proxy_user=" + context.proxy_user)
         if context.proxy_password:
-            args.append("-e proxy_password=" + context.proxy_password)
+            wget_args.append("-e proxy_password=" + context.proxy_password)
     print("Downloading", len(urls),  stage,
           "files using", nthreads, "threads...")
 
-    for i in range(nthreads):
-        child = threading.Thread(target=download,
-                                 args=(args,
-                                       '%s/%s-log.%d' % (context.var_path,
-                                                         stage, i),
-                                       download_queue))
-        child.start()
-        childrens.append(child)
-        i += 1
-        nthreads -= 1
+    if context.use_queue and nthreads > 1:
+        children = []
+        download_queue = queue.Queue()
+        for base_url, rel_path in urls:
+            download_queue.put(os.path.join(base_url, rel_path))
 
-    print("Begin time: ", time.strftime('%c'))
+        with open(os.path.join(context.var_path,
+                               stage + '-urls'),
+                  'wb') as URLS:
+            for base_url, rel_path in urls:
+                URLS.write(base_url + '/' + rel_path + '\n')
 
-    output("[" + str(len(childrens)) + "]... ")
-    for child in childrens:
-        child.join()
+        for i in range(nthreads):
+            child = threading.Thread(target=download_worker,
+                                     args=(wget_args,
+                                           rsync_args,
+                                           '%s/%s-log.%d' % (context.var_path,
+                                                             stage, i),
+                                           download_queue))
+            child.start()
+            children.append(child)
+            i += 1
+            nthreads -= 1
 
-    print("\nEnd time: ", time.strftime('%c'), "\n")
+        print("Begin time: ", time.strftime('%c'))
+
+        output("[" + str(len(children)) + "]... ")
+        for child in children:
+            child.join()
+
+        print("\nEnd time: ", time.strftime('%c'), "\n")
+
+    else:
+        # split rsync and others
+        rsync_urls = {}
+        wget_urls = []
+
+        for source, remote_path in urls:
+            if source.startswith('rsync://'):
+                if source in rsync_urls:
+                    rsync_urls[source].append(remote_path)
+                else:
+                    rsync_urls[source] = [remote_path]
+            else:
+                wget_urls.append(os.path.join(source, remote_path))
+
+        # batch wget download
+        children = []
+        nthreads = min(context.nthreads, len(wget_urls))
+        i = 0
+        while wget_urls:
+            # splice
+            amount = len(wget_urls) / nthreads
+            part = wget_urls[:amount]
+            wget_urls = wget_urls[amount:]
+            with open(os.path.join(context.var_path,
+                                   stage + '-urls.%d' % i),
+                      'w') as URLS:
+                URLS.write('\n'.join(part))
+
+            child = wget_batch_downloader(wget_args,
+                                          context.var_path + "/" + stage + "-urls.%d" % i,
+                                          context.var_path + "/" + stage + "-log.%d" % i
+                                          )
+            children.append(child)
+            i += 1
+            nthreads -= 1
+
+        if children:
+            print('Downloading use wget')
+            print("Begin time: ", time.strftime('%c'))
+            output("[" + str(len(children)) + "]... ")
+            while children:
+                pid, _retcode = os.wait()
+                children = [c for c in children if c.pid != pid]
+                output("[" + str(len(children)) + "]... ")
+            print("\nEnd time: ", time.strftime('%c'), "\n")
+
+        # batch rsync download
+        i = 0
+        for source in rsync_urls:
+            file_list = rsync_urls[source]
+            children = []
+            nthreads = min(context.nthreads, len(file_list))
+            while file_list:
+                # splice
+                amount = len(file_list) / nthreads
+                part = file_list[:amount]
+                file_list = file_list[amount:]
+                with open(os.path.join(context.var_path,
+                                       stage + '-files.%d' % i),
+                          'w') as FILES:
+                    FILES.write('#SOURCE: ' + source + '\n')
+                    FILES.write('\n'.join(part) + '\n')
+
+                local_dir = sanitise_uri(source)
+                if not os.path.exists(local_dir):
+                    os.makedirs(local_dir)
+
+                child = rsync_batch_downloader(rsync_args + [source + '/', local_dir],
+                                               context.var_path + "/" + stage + "-files.%d" % i,
+                                               context.var_path + "/" + stage + "-log.rsync.%d" % i
+                                               )
+                children.append(child)
+                i += 1
+                nthreads -= 1
+            if children:
+                print('Syncing from', source)
+                print("Begin time: ", time.strftime('%c'))
+                output("[" + str(len(children)) + "]... ")
+                while children:
+                    pid, _retcode = os.wait()
+                    children = [c for c in children if c.pid != pid]
+                    output("[" + str(len(children)) + "]... ")
+                print("\nEnd time: ", time.strftime('%c'), "\n")
 
 
 class AptMirror(object):
@@ -110,12 +213,17 @@ class AptMirror(object):
         self.unnecessary_bytes = 0
         # config
         self.config = MirrorConfig(config_file)
+        # global settings
+        import utils
+        utils.TILDE = self.config._tilde
+
         self.mirrors = []
         for base_url in self.config.mirrors:
             skel_path = os.path.join(
-                self.config.skel_path, sanitise_uri(base_url, self.config))
-            self.mirrors.append(MirrorSkel(
-                base_url, skel_path, self.config.mirrors[base_url]))
+                self.config.skel_path, sanitise_uri(base_url))
+            self.mirrors.append(MirrorSkel(remove_double_slashes(base_url),
+                                           skel_path,
+                                           self.config.mirrors[base_url]))
         return
 
     def run(self):
@@ -182,16 +290,23 @@ class AptMirror(object):
         else:
             return 1
 
-    def add_url_to_download(self, url, size=0, compressed=False):
-        download_url = remove_double_slashes(url, self.config)
-        if compressed:
-            for ext in COMPRESSIONS:
-                self.urls_to_download[download_url + ext] = size
+    def do_download(self, stage):
+        urls = sorted(self.urls_to_download.keys())
+        if stage == 'archive':
+            os.chdir(self.config.mirror_path)
         else:
-            self.urls_to_download[download_url] = size
+            os.chdir(self.config.skel_path)
+            # index urls
+            self.index_urls.extend([os.path.join(base_url, rel_path)
+                                    for base_url, rel_path in urls])
+
+        return download_urls(stage, urls, context=self.config)
+
+    def add_url_to_download(self, base_url, rel_path, size=0):
+        self.urls_to_download[(base_url, rel_path)] = size
 
     def process_index(self, uri, index_path):
-        base_path = sanitise_uri(uri, self.config)
+        base_path = sanitise_uri(uri)
         mirror = self.config.mirror_path + "/" + base_path
 
         if os.path.exists(index_path + '.gz'):
@@ -234,8 +349,8 @@ class AptMirror(object):
 
             if 'Filename' in data:
                 # Packages index
-                store_path = remove_double_slashes(base_path + "/" + data["Filename"],
-                                                   self.config)
+                rel_path = remove_double_slashes(data['Filename'])
+                store_path = os.path.join(base_path, rel_path)
                 self.config.skipclean[store_path] = 1
                 self.list_files['all'].write(store_path + '\n')
 
@@ -243,12 +358,14 @@ class AptMirror(object):
                     if key in data:
                         self.list_files[key].write(
                             data[key] + '  ' + store_path + '\n')
-                if self.need_update(os.path.join(mirror, data["Filename"]), int(data["Size"])):
-                    download_uri = uri + "/" + data["Filename"]
-                    self.list_files['new'].write(remove_double_slashes(
-                        download_uri, self.config) + "\n")
+                if self.need_update(os.path.join(mirror, rel_path), int(data["Size"])):
+                    download_uri = os.path.join(uri, rel_path)
+                    self.list_files['new'].write(download_uri + "\n")
                     self.add_url_to_download(
-                        download_uri, int(data["Size"]))
+                        uri,
+                        rel_path,
+                        int(data['Size'])
+                    )
             else:
                 # Sources index
                 for line in data['Files'].split('\n'):
@@ -259,21 +376,19 @@ class AptMirror(object):
                         md5sum, size, fn = line.split()
                     except:
                         raise Exception('apt-mirror: invalid Sources format')
-                    store_path = remove_double_slashes(base_path + "/" + data["Directory"] + "/" + fn,
-                                                       self.config)
+                    rel_path = remove_double_slashes(
+                        data["Directory"] + "/" + fn)
+                    store_path = os.path.join(base_path, rel_path)
                     self.config.skipclean[store_path] = 1
                     self.list_files['all'].write(store_path + "\n")
                     self.list_files['MD5sum'].write(
                         md5sum + "  " + store_path + "\n")
-                    if self.need_update(mirror + "/" + data["Directory"] + "/" + fn, int(size)):
-                        download_uri = uri + "/" + \
-                            data["Directory"] + "/" + fn
-                        self.list_files['new'].write(remove_double_slashes(
-                            download_uri,
-                            self.config
-                        ) + "\n")
+                    if self.need_update(os.path.join(mirror, rel_path), int(size)):
+                        download_uri = os.path.join(uri, rel_path)
+                        self.list_files['new'].write(download_uri + "\n")
                         self.add_url_to_download(
-                            download_uri, int(size))
+                            uri,
+                            rel_path, int(size))
 
         index_file.close()
 
@@ -281,17 +396,14 @@ class AptMirror(object):
         self.urls_to_download = {}
 
         for mirror in self.mirrors:
-            for url in mirror.get_index_urls(contents=self.config._contents):
-                self.add_url_to_download(url)
+            for rel_path in mirror.get_indexes(contents=self.config._contents):
+                self.add_url_to_download(
+                    mirror.url, remove_double_slashes(rel_path))
 
-        os.chdir(self.config.skel_path)
-        self.index_urls = sorted(self.urls_to_download.keys())
-        download_urls("index", self.index_urls, self.config)
+        self.do_download('index')
 
-        for key in self.urls_to_download.keys():
-            path = key.split('://')[-1]
-            if self.config._tilde:
-                path = path.replace('~', '%7E')
+        for base_url, rel_path in self.urls_to_download.keys():
+            path = os.path.join(base_url.split('://')[-1], rel_path)
             self.config.skipclean[path] = 1
             if path.endswith('.gz') or path.endswith('.bz2'):
                 self.config.skipclean[path.rsplit('.', 1)[0]] = 1
@@ -303,20 +415,17 @@ class AptMirror(object):
         for mirror in self.mirrors:
             for suite in mirror.suites:
                 output('T')
-                for url, size in suite.find_translation_files_in_index().items():
-                    self.add_url_to_download(url, size)
+                for rel_path, size in suite.find_translation_files_in_index().items():
+                    self.add_url_to_download(
+                        mirror.url, remove_double_slashes(rel_path), size)
 
         output("]\n\n")
 
-        self.index_urls.extend(sorted(self.urls_to_download.keys()))
-        download_urls("translation", sorted(
-            self.urls_to_download.keys()), self.config)
+        self.do_download('translation')
 
-        for url in self.urls_to_download.keys():
-            url = url.split('://')[-1]
-            if self.config._tilde:
-                url = url.replace('~', '%7E')
-            self.config.skipclean[url] = 1
+        for base_url, rel_path in self.urls_to_download.keys():
+            path = os.path.join(base_url.split('://')[-1], rel_path)
+            self.config.skipclean[path] = 1
 
     def download_dep11(self):
         # DEP-11 index download
@@ -325,20 +434,17 @@ class AptMirror(object):
         for mirror in self.mirrors:
             for suite in mirror.suites:
                 output('D')
-                for url,size in suite.find_dep11_files_in_release().items():
-                    self.add_url_to_download(url,size)
+                for rel_path, size in suite.find_dep11_files_in_release().items():
+                    self.add_url_to_download(
+                        mirror.url, remove_double_slashes(rel_path), size)
 
         output("]\n\n")
 
-        self.index_urls.extend(sorted(self.urls_to_download.keys()))
-        download_urls("dep11", sorted(
-            self.urls_to_download.keys()), self.config)
+        self.do_download('dep11')
 
-        for url in self.urls_to_download.keys():
-            url = url.split('://')[-1]
-            if self.config._tilde:
-                url = url.replace('~', '%7E')
-            self.config.skipclean[url] = 1
+        for base_url, rel_path in self.urls_to_download.keys():
+            path = os.path.join(base_url.split('://')[-1], rel_path)
+            self.config.skipclean[path] = 1
 
     def download_archive(self):
         self.urls_to_download = {}
@@ -370,16 +476,13 @@ class AptMirror(object):
 
         for fp in self.list_files.values():
             fp.close()
-        os.chdir(self.config.mirror_path)
 
         need_bytes = sum(self.urls_to_download.itervalues())
 
         size_output = format_bytes(need_bytes)
 
         print(size_output, " will be downloaded into archive.")
-
-        download_urls("archive", sorted(
-            self.urls_to_download.keys()), self.config)
+        self.do_download('archive')
 
     def copy_skel(self):
         # Copy skel to main archive
@@ -387,16 +490,16 @@ class AptMirror(object):
             if not re.match(r'^(\w+)://', url):
                 raise Exception(
                     'apt-mirror: invalid url "%s" in index_urls' % url)
-            rel_url = sanitise_uri(url, self.config)
-            copy_file(self.config.skel_path + "/" + rel_url,
-                      self.config.mirror_path + "/" + rel_url,
+            rel_store_path = sanitise_uri(url)
+            copy_file(self.config.skel_path + "/" + rel_store_path,
+                      self.config.mirror_path + "/" + rel_store_path,
                       unlink=self.config.unlink)
             for ext in COMPRESSIONS:
                 if url.endswith(ext):
                     raw_file = url.rsplit('.', 1)[0]
-                    rel_url = sanitise_uri(raw_file, self.config)
-                    copy_file(self.config.skel_path + "/" + rel_url,
-                              self.config.mirror_path + "/" + rel_url,
+                    rel_store_path = sanitise_uri(raw_file)
+                    copy_file(self.config.skel_path + "/" + rel_store_path,
+                              self.config.mirror_path + "/" + rel_store_path,
                               unlink=self.config.unlink)
 
     def process_file(self, path):
@@ -404,7 +507,7 @@ class AptMirror(object):
             path = path.replace('~', '%7E')
         if self.config.skipclean.get(path):
             return 1
-        self.rm_files.append(sanitise_uri(path, self.config))
+        self.rm_files.append(sanitise_uri(path))
 
         block_count, block_size = os.popen(
             'stat -c "%b,%B" ' + path).read().strip().split(',')
@@ -445,8 +548,6 @@ class AptMirror(object):
         if self.config._autoclean:
             print(size_output, "in", total, "files and",
                   len(self.rm_dirs), "directories will be freed...")
-
-            os.chdir(self.config.mirror_path)
 
             for path in self.rm_files:
                 os.unlink(path)

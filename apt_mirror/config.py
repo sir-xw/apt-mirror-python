@@ -51,6 +51,7 @@ class MirrorConfig(object):
         default_arch = os.popen('dpkg --print-architecture').read().strip()
         self.vars = {"defaultarch": default_arch or 'i386',
                      "nthreads": '20',
+                     "use_queue": '0',
                      "base_path": '/var/spool/apt-mirror',
                      "mirror_path": '$base_path/mirror',
                      "skel_path": '$base_path/skel',
@@ -92,7 +93,7 @@ class MirrorConfig(object):
             else:
                 break
         # int variables
-        if key in ['nthreads', '_contents', '_autoclean', '_tilde',
+        if key in ['nthreads', 'use_queue', '_contents', '_autoclean', '_tilde',
                    'run_postmirror', 'auth_no_challenge',
                    'no_check_certificate', 'unlink']:
             try:
@@ -129,11 +130,13 @@ class MirrorConfig(object):
                 suite = components[0]
                 components = components[1:] or ['']
                 if base_url not in self.mirrors:
-                    self.mirrors[base_url] = {suite:{c:[arch] for c in components}}
+                    self.mirrors[base_url] = {
+                        suite: {c: [arch] for c in components}}
                 else:
                     mirror_data = self.mirrors[base_url]
                     if suite not in mirror_data:
-                        mirror_data[suite] = {c:set([arch]) for c in components}
+                        mirror_data[suite] = {
+                            c: set([arch]) for c in components}
                     else:
                         suite_data = mirror_data[suite]
                         for c in components:
@@ -149,11 +152,13 @@ class MirrorConfig(object):
                 suite = components[0]
                 components = components[1:] or ['']
                 if base_url not in self.mirrors:
-                    self.mirrors[base_url] = {suite:{c:[arch] for c in components}}
+                    self.mirrors[base_url] = {
+                        suite: {c: [arch] for c in components}}
                 else:
                     mirror_data = self.mirrors[base_url]
                     if suite not in mirror_data:
-                        mirror_data[suite] = {c:set([arch]) for c in components}
+                        mirror_data[suite] = {
+                            c: set([arch]) for c in components}
                     else:
                         suite_data = mirror_data[suite]
                         for c in components:

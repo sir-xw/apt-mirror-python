@@ -1,3 +1,6 @@
+* 0.4.2 (2019-03-07)
+ - download queue disabled by default, because too slow...
+ - use file list for rsync in standard download mode, like wget does.
 * 0.4 (2019-02-18)
  - download queue.
  - support rsync:// mirror (call rsync command, only support public rsync server).
