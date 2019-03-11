@@ -131,7 +131,7 @@ class MirrorConfig(object):
                 components = components[1:] or ['']
                 if base_url not in self.mirrors:
                     self.mirrors[base_url] = {
-                        suite: {c: [arch] for c in components}}
+                        suite: {c: set([arch]) for c in components}}
                 else:
                     mirror_data = self.mirrors[base_url]
                     if suite not in mirror_data:
@@ -141,7 +141,7 @@ class MirrorConfig(object):
                         suite_data = mirror_data[suite]
                         for c in components:
                             if c not in suite_data:
-                                suite_data[c] = [arch]
+                                suite_data[c] = set([arch])
                             else:
                                 suite_data[c].add(arch)
                 continue
@@ -153,7 +153,7 @@ class MirrorConfig(object):
                 components = components[1:] or ['']
                 if base_url not in self.mirrors:
                     self.mirrors[base_url] = {
-                        suite: {c: [arch] for c in components}}
+                        suite: {c: set([arch]) for c in components}}
                 else:
                     mirror_data = self.mirrors[base_url]
                     if suite not in mirror_data:
@@ -163,7 +163,7 @@ class MirrorConfig(object):
                         suite_data = mirror_data[suite]
                         for c in components:
                             if c not in suite_data:
-                                suite_data[c] = [arch]
+                                suite_data[c] = set([arch])
                             else:
                                 suite_data[c].add(arch)
                 continue
