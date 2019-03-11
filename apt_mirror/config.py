@@ -21,6 +21,7 @@ CONFIG_CLEAN_PATTERN = re.compile(
 
 
 def parse_config_line(line):
+    config = {'type':''}  # for bad config line
     match = CONFIG_MIRROR_PATTERN.match(line)
     if match:
         config = match.groupdict()
