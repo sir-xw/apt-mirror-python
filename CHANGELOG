@@ -1,3 +1,6 @@
+* 0.4.3 (2019-03-11)
+ - fix a bug when download multiple arches from same distribution
+ - fix a bug of downloading translation files with d-i component
 * 0.4.2 (2019-03-07)
  - download queue disabled by default, because too slow...
  - use file list for rsync in standard download mode, like wget does.

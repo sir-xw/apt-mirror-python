@@ -95,7 +95,7 @@ class SuiteSkel(object):
                                 component + '/Contents-' + arch)
         return index_list
 
-    def find_translation_files_in_release(self):
+    def find_translation_files_in_release(self, components):
         """Look in the dists/DIST/Release file for the translation files that belong
         to the given component.
         """
@@ -115,7 +115,7 @@ class SuiteSkel(object):
                     parts = line.split()
                     if len(parts) == 3:
                         _sha1, size, filename = parts
-                        if re.match('^(' + '|'.join(self.components) + r')/i18n/Translation-[^./]*\.bz2', filename):
+                        if re.match('^(' + '|'.join(components) + r')/i18n/Translation-[^./]*\.bz2', filename):
                             files[os.path.join(
                                 self.rel_path, filename)] = int(size)
                     else:
@@ -137,6 +137,7 @@ class SuiteSkel(object):
             return {}
 
         files = {}
+        not_found = []
         for component in self.components:
             i18n_dir = component + '/i18n'
             base_url = os.path.join(self.url, i18n_dir)
@@ -145,7 +146,8 @@ class SuiteSkel(object):
             try:
                 index_file = open(index_path)
             except:
-                return self.find_translation_files_in_release()
+                not_found.append(component)
+                continue
 
             checksums = 0
             for line in index_file.readlines():
@@ -167,6 +169,10 @@ class SuiteSkel(object):
                         checksums = 1
 
             index_file.close()
+
+        if not_found:
+            files.update(self.find_translation_files_in_release(
+                components=not_found))
 
         return files
 
