@@ -63,6 +63,7 @@ def download_urls(stage, urls, context):
     rsync_args = ['rsync', '-t', '--no-motd',
                   '-K', '-l', '--copy-unsafe-links',
                   '--ignore-missing-args',
+                  '--timeout=900',
                   '--bwlimit', context.limit_rate]
 
     if context.auth_no_challenge == 1:
