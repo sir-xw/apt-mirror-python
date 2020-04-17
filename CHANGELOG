@@ -1,3 +1,7 @@
+* 0.4.5 (2020-04-17)
+ - rsync use '-L' option
+* 0.4.4 (2020-03-18)
+ - add --timeout=900 to rsync, same as the default timeout of wget
 * 0.4.3 (2019-03-11)
  - fix a bug when download multiple arches from same distribution
  - fix a bug of downloading translation files with d-i component
