@@ -237,6 +237,7 @@ class AptMirror(object):
         self.download_skel()
         self.download_translation()
         self.download_dep11()
+        self.download_cnf()
 
         # Main download
         self.download_archive()
@@ -444,6 +445,25 @@ class AptMirror(object):
         output("]\n\n")
 
         self.do_download('dep11')
+
+        for base_url, rel_path in self.urls_to_download.keys():
+            path = os.path.join(base_url.split('://')[-1], rel_path)
+            self.config.skipclean[path] = 1
+    
+    def download_cnf(self):
+            # DEP-11 index download
+        self.urls_to_download = {}
+        output("Processing Commands indexes: [")
+        for mirror in self.mirrors:
+            for suite in mirror.suites:
+                output('D')
+                for rel_path, size in suite.find_cnf_files_in_release().items():
+                    self.add_url_to_download(
+                        mirror.url, remove_double_slashes(rel_path), size)
+
+        output("]\n\n")
+
+        self.do_download('cnf')
 
         for base_url, rel_path in self.urls_to_download.keys():
             path = os.path.join(base_url.split('://')[-1], rel_path)

@@ -212,3 +212,40 @@ class SuiteSkel(object):
                     checksums = 1
 
         return files
+
+    def find_cnf_files_in_release(self):
+        # Look in the dists/DIST/Release file for the cnf/Command-* files
+        if self.simple:
+            return {}
+
+        release_url = os.path.join(self.url, 'Release')
+        release_path = os.path.join(self.skel_path, 'Release')
+
+        release_file = open(release_path)
+
+        files = {}
+        checksums = 0
+        for line in release_file.readlines():
+            line = line.rstrip()
+            if checksums:
+                if re.match(r'^ +(.*)', line):
+                    parts = line.split()
+                    if len(parts) == 3:
+                        _sha1, size, filename = parts
+                        for component, arch_list in self.components.items():
+                            fn_pattern = r'Commands-(' + \
+                                '|'.join(arch_list) + r')\.(gz|bz2|xz)'
+                            if re.match(component + r'/cnf/' + fn_pattern, filename):
+                                files[os.path.join(self.rel_path, filename)] = int(
+                                    size)
+                                break
+                    else:
+                        logging.warn("Malformed checksum line \"%s\" in %s" %
+                                     (line, release_url))
+                else:
+                    checksums = 0
+            if not checksums:
+                if line == "SHA256:":
+                    checksums = 1
+
+        return files
