@@ -217,7 +217,7 @@ class AptMirror(object):
         # config
         self.config = MirrorConfig(config_file)
         # global settings
-        import utils
+        from . import utils
         utils.TILDE = self.config._tilde
 
         self.mirrors = []
